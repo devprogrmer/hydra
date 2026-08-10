@@ -1,0 +1,30 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: bash -n hydra.sh && bash -n install.sh
+
+      - name: Build tarball
+        run: |
+          tar -czf hydra-${GITHUB_REF_NAME}.tar.gz hydra.sh install.sh README.md README.fa.md LICENSE
+          sha256sum hydra-${GITHUB_REF_NAME}.tar.gz > SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: docs/RELEASE.md
+          files: |
+            hydra-*.tar.gz
+            SHA256SUMS

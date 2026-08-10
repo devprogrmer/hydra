@@ -1,0 +1,12 @@
+# never commit secrets
+*.key
+*.pub
+token-*.txt
+*.conf.local
+.env
+.env.*
+
+# runtime / local
+*.log
+*.tmp
+/state/
