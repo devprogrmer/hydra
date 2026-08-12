@@ -1,4 +1,4 @@
-# hydra v3.4.0
+# hydra v3.6.0
 
 Multi-exit gaming tunnel with FEC, faketcp obfuscation and automatic latency-based
 failover. English interface, one-line curl install, no Docker.
@@ -9,6 +9,51 @@ failover. English interface, one-line curl install, no Docker.
 ---
 
 ## English
+
+### New in 3.6.0 — self-healing
+
+Some links drop every few hours no matter how well they are configured. A changing hub
+address, a udp2raw session that dies quietly, an ISP that resets long-lived flows — none
+of these are fixed by tuning. They are fixed by periodic action.
+
+- **Scheduled reset.** A systemd timer restarts every tunnel on an interval (6 hours by
+  default, 1–168 configurable). Blunt, but it clears stale sessions and a hub address that
+  has changed underneath a peer entry.
+- **Handshake watchdog.** Targeted rather than blunt: checks every tunnel each minute and
+  restarts only the one whose handshake has been quiet for over four minutes. Requires two
+  consecutive failures before acting, so a single missed keepalive does not cause a
+  restart loop.
+- **Overview screen.** Role, public address, load, every hydra service, every tunnel with
+  its handshake age and transfer counters, and recent events — on one screen instead of
+  spread across three menus.
+
+The reset-timer approach is taken from [Azumi67's tunnel
+projects](https://github.com/Azumi67), where the same pattern appears across several
+repositories precisely because the underlying problem is so common on these routes.
+
+### New in 3.5.0 — fewer ways to get stuck
+
+This release is a direct response to a long, painful setup session. Every item here
+corresponds to something that actually cost hours.
+
+- **Preflight checks** before creating or joining a tunnel. Verifies the binaries exist,
+  that UDPspeeder actually *starts* (a bad flag used to make it exit instantly and take
+  the whole tunnel down silently), that the WireGuard module loads, that DNS resolves —
+  a real cause of failed downloads on Iranian servers — and whether the hub's public
+  address is stable, which `plain` mode requires.
+- **Pairing now verifies itself.** It waits up to 25 seconds for a real handshake and
+  says whether it succeeded. On failure it lists the likely causes in order — closed
+  firewall port, mismatched FEC, filtered path — instead of reporting success and leaving
+  you to discover `down` in the status table.
+- **`--fix-gro`** on both udp2raw services, which resolves the "huge packet" failure seen
+  on many VPS providers.
+- **Rebuild a tunnel** — one action that tears down services, orphaned processes,
+  interfaces, iptables rules and keys, then tells you exactly how to recreate it. Manual
+  half-cleanups were the cause of several of the hardest failures.
+
+Credit where due: the `--fix-gro` fix and the always-uninstall-before-reconfiguring
+discipline come from studying [Azumi67's tunnel projects](https://github.com/Azumi67),
+which cover this problem space thoroughly.
 
 ### New in 3.4.0 — game latency testing
 

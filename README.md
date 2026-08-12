@@ -426,9 +426,36 @@ verified yourself. The estimates are only as good as the endpoints behind them.
 
 ---
 
+## When the link drops every few hours
+
+Some routes will not stay up regardless of configuration. The hub's public address
+changes, a udp2raw session dies without notice, or an ISP resets long-lived flows. Menu →
+**Self-healing** handles both shapes of this problem:
+
+**Scheduled reset** restarts every tunnel on a timer, 6 hours by default. It is a blunt
+instrument, and that is the point — it clears any stale state, including a peer entry
+pointing at a hub address that no longer exists.
+
+**Handshake watchdog** is the targeted version. It checks each tunnel every minute and
+restarts only the one whose handshake has gone quiet for more than four minutes. Two
+consecutive failures are required before it acts, so one missed keepalive will not send it
+into a restart loop.
+
+Run both. The watchdog catches most failures within a couple of minutes; the scheduled
+reset catches whatever the watchdog cannot see.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Check |
+|---|---|
+| Everything looks `active` but `0 B received` | FEC settings differ between the two ends. They must match exactly. |
+| Tunnel `down`, `Diagnose` says `not paired` | Finish pairing was never completed on the hub. Re-issue the invite and redo it. |
+| Handshake works, large transfers stall | MTU. Menu → Link tuning → Find the working MTU. |
+| Service restarts in a loop | `journalctl -u hydra-spd@NAME -n 20` — the FEC binary prints its reason. |
+| Downloads fail during install | DNS. Try a different resolver in `/etc/resolv.conf`. |
+| Nothing works after several manual fixes | Menu → Manage tunnels → Rebuild a tunnel, then recreate it through the menu without hand-editing. |
 |---|---|
 | No handshake | `journalctl -u hydra-raw@NAME -n 50` — usually the TCP port is closed in the exit's firewall |
 | udp2raw won't connect | Add `--lower-level auto` to the service (some VPS iptables setups conflict) |

@@ -9,7 +9,7 @@
 set -uo pipefail
 umask 077                      # every file this script creates is owner-only
 
-VERSION="3.4.0"
+VERSION="3.6.0"
 DIR="/etc/hydra"
 EXITS="$DIR/exits.d"          # hub:  one file per foreign server
 LINKS="$DIR/links.d"          # exit: one file per hub
@@ -68,7 +68,7 @@ CLIENT_WG_PORT="51820"; LINK_PREFIX="10.66"
 RAW_PORT_BASE="39000"; SPD_LOCAL_BASE="44000"; RAW_LOCAL_BASE="33000"
 FEC="10:5"; SWITCH_MARGIN="15"; CHECK_INTERVAL="5"; HYSTERESIS="3"; PUBLIC_IF=""
 CLIENT_ISOLATION="1"; TOKEN_TTL="1800"
-SPD_MODE="0"; SPD_TIMEOUT="0"; SPD_QUEUE="200"
+SPD_MODE="0"; SPD_TIMEOUT="0"; SPD_QUEUE="200"; RESET_HOURS="6"
 HUB_PUBLIC_IP=""; INGRESS_LOCK="1"
 [[ -f "$CONF" ]] && . "$CONF"
 
@@ -95,6 +95,7 @@ INGRESS_LOCK=$INGRESS_LOCK
 SPD_MODE=$SPD_MODE
 SPD_TIMEOUT=$SPD_TIMEOUT
 SPD_QUEUE=$SPD_QUEUE
+RESET_HOURS=$RESET_HOURS
 EOF
   chmod 600 "$CONF"
 }
@@ -274,7 +275,7 @@ Description=hydra udp2raw client (%i)
 After=network-online.target
 [Service]
 EnvironmentFile=/etc/hydra/exits.d/%i.conf
-ExecStart=/usr/local/bin/udp2raw -c -l 127.0.0.1:${RAW_LOCAL} -r ${EXIT_IP}:${RAW_PORT} -k ${RAW_PASS} --raw-mode faketcp --cipher-mode aes128cbc --auth-mode hmac_sha1 -a
+ExecStart=/usr/local/bin/udp2raw -c -l 127.0.0.1:${RAW_LOCAL} -r ${EXIT_IP}:${RAW_PORT} -k ${RAW_PASS} --raw-mode faketcp --cipher-mode aes128cbc --auth-mode hmac_sha1 -a --fix-gro
 Restart=always
 RestartSec=2
 Nice=-10
@@ -314,7 +315,7 @@ Description=hydra udp2raw server (%i)
 After=network-online.target
 [Service]
 EnvironmentFile=/etc/hydra/links.d/%i.conf
-ExecStart=/usr/local/bin/udp2raw -s -l 0.0.0.0:${RAW_PORT} -r 127.0.0.1:${SPD_LOCAL} -k ${RAW_PASS} --raw-mode faketcp --cipher-mode aes128cbc --auth-mode hmac_sha1 -a
+ExecStart=/usr/local/bin/udp2raw -s -l 0.0.0.0:${RAW_PORT} -r 127.0.0.1:${SPD_LOCAL} -k ${RAW_PASS} --raw-mode faketcp --cipher-mode aes128cbc --auth-mode hmac_sha1 -a --fix-gro
 Restart=always
 RestartSec=2
 Nice=-10
@@ -464,9 +465,78 @@ next_idx() {
   echo 0
 }
 
+# Everything that silently broke a tunnel in practice, checked up front.
+preflight() {
+  local role_now="$1" fail=0 warnc=0
+  echo -e "  ${W}Preflight${N}"
+
+  # binaries
+  local b
+  for b in udp2raw speederv2 wg; do
+    if command -v "$b" >/dev/null; then
+      printf "    %-26s ${G}ok${N}\n" "$b"
+    else
+      printf "    %-26s ${R}MISSING${N}\n" "$b"; fail=1
+    fi
+  done
+
+  # can the FEC binary actually start? (the --report 0 class of bug)
+  if command -v speederv2 >/dev/null; then
+    if timeout 3 speederv2 -c -l 127.0.0.1:59998 -r 127.0.0.1:59999 -f 10:5 --mode 0 \
+         --timeout 0 --mtu 1200 -k preflight >/dev/null 2>&1 & then
+      sleep 1; pkill -f "k preflight" 2>/dev/null
+      printf "    %-26s ${G}ok${N}\n" "speederv2 starts"
+    fi
+  fi
+
+  # kernel bits
+  if lsmod 2>/dev/null | grep -q wireguard || modprobe wireguard 2>/dev/null; then
+    printf "    %-26s ${G}ok${N}\n" "wireguard module"
+  else
+    printf "    %-26s ${R}MISSING${N}\n" "wireguard module"; fail=1
+  fi
+
+  # forwarding
+  if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == 1 ]]; then
+    printf "    %-26s ${G}ok${N}\n" "ip_forward"
+  else
+    printf "    %-26s ${Y}off${N}\n" "ip_forward"; warnc=1
+  fi
+
+  # DNS - a real cause of failed downloads on Iranian servers
+  if timeout 5 getent hosts github.com >/dev/null 2>&1; then
+    printf "    %-26s ${G}ok${N}\n" "DNS resolution"
+  else
+    printf "    %-26s ${Y}failing${N}\n" "DNS resolution"
+    echo -e "      ${D}downloads will fail - try setting a different resolver in /etc/resolv.conf${N}"
+    warnc=1
+  fi
+
+  # a stable public address matters for plain mode
+  if [[ "$role_now" == hub ]]; then
+    local a b
+    a="$(detect_pub_ip)"; sleep 1; b="$(detect_pub_ip)"
+    if [[ -n "$a" && "$a" == "$b" ]]; then
+      printf "    %-26s ${G}%s${N}\n" "public address" "$a"
+    else
+      printf "    %-26s ${Y}changing${N}\n" "public address"
+      echo -e "      ${D}saw $a then $b - avoid 'plain' mode, it needs a stable endpoint${N}"
+      warnc=1
+    fi
+  fi
+
+  echo
+  (( fail )) && { err "Preflight failed. Fix the missing pieces first."; return 1; }
+  (( warnc )) && warn "Preflight passed with warnings."
+  return 0
+}
+
 create_tunnel() {
   clear; banner; echo; hr
   echo -e "  ${W}${BLD}Create a new tunnel to a foreign server${N}"; hr; echo
+
+  preflight hub || { pause; return; }
+  echo; hr; echo
 
   local name eip mode
   name="$(ask "Name for this foreign server (e.g. de1, nl1)")"
@@ -616,8 +686,36 @@ EOF
   systemctl enable --now "hydra-link@$NAME" >/dev/null 2>&1
   systemctl enable --now hydra-watch >/dev/null 2>&1
   logit "tunnel $NAME paired"
-  echo; ok "Tunnel '$NAME' is paired and starting."
-  echo -e "  ${D}The invite token has been wiped. Give it a few seconds, then check the status table.${N}"
+  echo; ok "Tunnel '$NAME' is paired. Waiting for the handshake…"
+
+  # Do not just claim success - wait and verify, then say what to do if it fails.
+  local i hs=""
+  for i in $(seq 1 12); do
+    sleep 2
+    hs="$(wg show "wg-$NAME" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)"
+    [[ -n "$hs" && "$hs" != 0 ]] && break
+    printf "\r  ${D}waiting… %ss${N}  " $((i*2))
+  done
+  printf "\r%*s\r" 40 ""
+
+  if [[ -n "$hs" && "$hs" != 0 ]]; then
+    ok "Handshake complete. The tunnel is up."
+  else
+    warn "No handshake after 25 seconds."
+    echo
+    echo -e "  ${W}Most likely causes, in order:${N}"
+    local MODE RAW_PORT WG_PORT
+    . "$EXITS/$NAME.conf"
+    case "$MODE" in
+      full)  echo -e "   ${W}1.${N} TCP port ${W}$RAW_PORT${N} is closed in the exit's firewall" ;;
+      fec)   echo -e "   ${W}1.${N} UDP port ${W}$RAW_PORT${N} is closed in the exit's firewall" ;;
+      plain) echo -e "   ${W}1.${N} UDP port ${W}$WG_PORT${N} is closed in the exit's firewall" ;;
+    esac
+    echo -e "   ${W}2.${N} FEC settings differ between the two ends (they must match exactly)"
+    echo -e "   ${W}3.${N} Your ISP is filtering this path - try mode 'fec', or another exit"
+    echo
+    echo -e "  ${D}Run 'Diagnose a tunnel' to see which layer is stuck.${N}"
+  fi
   pause
 }
 
@@ -645,6 +743,7 @@ apply_token() {
     err "Token $(tok_err 5)."; return 1
   fi
 
+  preflight exit >/dev/null 2>&1 || true
   [[ -d "$LINKS" ]] || { msg "Running base install first…"
                          install_deps; install_binaries
                          mkdir -p "$LINKS" "$STATE" /etc/wireguard; chmod 700 "$DIR" /etc/wireguard
@@ -1003,6 +1102,7 @@ tunnel_menu() {
     show_status_hub; echo; hr
     echo -e "   ${G}1${N}) ${W}Finish pairing${N}   ${D}paste the exit's reply token${N}"
     echo -e "   ${G}2${N}) Re-issue invite  ${G}3${N}) Delete tunnel   ${G}4${N}) Restart all"
+    echo -e "   ${G}7${N}) ${W}Rebuild a tunnel${N}  ${D}clean teardown when it is stuck${N}"
     echo -e "   ${G}5${N}) Pin to an exit   ${G}6${N}) Back to automatic"
     echo -e "   ${G}0${N}) Back"; echo
     case "$(ask "Choice")" in
@@ -1024,6 +1124,7 @@ tunnel_menu() {
            mkdir -p "$STATE"; echo "$n" >"$STATE/active"; ok "Pinned to '$n'."
          else err "Not found."; fi; pause ;;
       6) rm -f "$DIR/pin"; ok "Automatic selection re-enabled."; pause ;;
+      7) rebuild_tunnel ;;
       0|"") return ;;
     esac
   done
@@ -1363,6 +1464,216 @@ bandwidth_test() {
   pause
 }
 
+# ============================================================== self-healing ==
+#  Two failure modes that no amount of tuning fixes, both common on Iranian
+#  links, both solved by periodic action rather than by configuration:
+#
+#   1. the hub's public address changes, so the exit's peer entry goes stale
+#   2. the udp2raw session dies quietly and never re-establishes
+#
+#  Azumi's projects ship a reset timer for exactly this. So do we now.
+
+RESET_HOURS_DEFAULT=6
+
+heal_install() {
+  cat >/etc/systemd/system/hydra-heal.service <<'EOF'
+[Unit]
+Description=hydra tunnel self-heal
+After=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hydra _heal
+EOF
+  cat >/etc/systemd/system/hydra-heal.timer <<EOF
+[Unit]
+Description=hydra periodic tunnel reset
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=${RESET_HOURS:-$RESET_HOURS_DEFAULT}h
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+
+  # watchdog: reacts to a dead handshake within minutes, not hours
+  cat >/etc/systemd/system/hydra-guard.service <<'EOF'
+[Unit]
+Description=hydra handshake watchdog
+After=network-online.target
+[Service]
+ExecStart=/usr/local/bin/hydra _guard
+Restart=always
+RestartSec=30
+EOF
+  systemctl daemon-reload
+}
+
+# Full periodic reset of every tunnel, in the order that actually works.
+_heal() {
+  local f n restarted=0
+  for f in "$EXITS"/*.conf; do
+    [[ -f "$f" ]] || continue
+    n="$(basename "$f" .conf)"
+    [[ "$(sed -n 's/^PAIRED=//p' "$f")" == 1 ]] || continue
+    systemctl restart "hydra-link@$n" >/dev/null 2>&1 && restarted=$((restarted+1))
+    sleep 2
+  done
+  for f in "$LINKS"/*.conf; do
+    [[ -f "$f" ]] || continue
+    n="$(basename "$f" .conf)"
+    systemctl restart "hydra-exit-link@$n" >/dev/null 2>&1 && restarted=$((restarted+1))
+    sleep 2
+  done
+  logit "scheduled reset: $restarted link(s) restarted"
+  exit 0
+}
+
+# Watch handshakes; restart only the link that is actually stuck.
+_guard() {
+  local grace="${GUARD_GRACE:-240}"     # seconds without a handshake before acting
+  local -A strikes=()
+  while :; do
+    local f n hs now age
+    now="$(date +%s)"
+    for f in "$EXITS"/*.conf "$LINKS"/*.conf; do
+      [[ -f "$f" ]] || continue
+      n="$(basename "$f" .conf)"
+      wg show "wg-$n" >/dev/null 2>&1 || continue
+      hs="$(wg show "wg-$n" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)"
+      if [[ -z "$hs" || "$hs" == 0 ]]; then age=99999; else age=$(( now - hs )); fi
+      if (( age > grace )); then
+        strikes[$n]=$(( ${strikes[$n]:-0} + 1 ))
+        if (( ${strikes[$n]} >= 2 )); then
+          if [[ -f "$EXITS/$n.conf" ]]; then
+            systemctl restart "hydra-link@$n" >/dev/null 2>&1
+          else
+            systemctl restart "hydra-exit-link@$n" >/dev/null 2>&1
+          fi
+          logit "guard: $n had no handshake for ${age}s - restarted"
+          strikes[$n]=0
+          sleep 30
+        fi
+      else
+        strikes[$n]=0
+      fi
+    done
+    sleep 60
+  done
+}
+
+# Azumi's scripts expose a live status/log view on every tunnel. Ours buried the
+# same information across three menus. This puts it on one screen.
+overview() {
+  clear; banner; echo; hr
+  echo -e "  ${W}${BLD}Overview${N}"; hr; echo
+
+  local role_now; role_now="$(role)"
+  echo -e "  ${W}System${N}"
+  echo -e "    role                  ${W}$([[ "$role_now" == hub ]] && echo "hub" || echo "exit")${N}"
+  echo -e "    public address        ${W}$(pub_ip)${N}"
+  echo -e "    congestion control    ${W}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${N}"
+  echo -e "    uptime                ${W}$(uptime -p 2>/dev/null | sed 's/^up //')${N}"
+  echo -e "    load                  ${W}$(awk '{print $1", "$2", "$3}' /proc/loadavg)${N}  ${D}$(nproc) core(s)${N}"
+  echo
+  echo -e "  ${W}Services${N}"
+  local u st
+  for u in hydra-watch hydra-rule hydra-ports hydra-guard; do
+    systemctl list-unit-files "$u.service" >/dev/null 2>&1 || continue
+    st="$(systemctl is-active "$u" 2>/dev/null)"
+    printf "    %-21s %b\n" "$u" "$([[ "$st" == active ]] && echo "${G}$st${N}" || echo "${D}$st${N}")"
+  done
+  st="$(systemctl is-enabled hydra-heal.timer 2>/dev/null)"
+  printf "    %-21s %b\n" "hydra-heal.timer" "$([[ "$st" == enabled ]] && echo "${G}$st${N}" || echo "${D}${st:-not set up}${N}")"
+  echo
+  echo -e "  ${W}Tunnels${N}"
+  local dir="$EXITS"; [[ "$role_now" != hub ]] && dir="$LINKS"
+  local f n hs age any=0
+  printf "    ${W}%-12s %-6s %-10s %-12s %s${N}\n" "NAME" "MODE" "FEC" "HANDSHAKE" "TRANSFER"
+  for f in "$dir"/*.conf; do
+    [[ -f "$f" ]] || continue; any=1
+    n="$(basename "$f" .conf)"
+    local MODE FEC; MODE="$(sed -n 's/^MODE=//p' "$f")"; FEC="$(sed -n 's/^FEC=//p' "$f")"
+    if wg show "wg-$n" >/dev/null 2>&1; then
+      hs="$(wg show "wg-$n" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)"
+      local tx; tx="$(wg show "wg-$n" transfer 2>/dev/null | awk '{print $2" rx / "$3" tx"}')"
+      if [[ -n "$hs" && "$hs" != 0 ]]; then
+        age=$(( $(date +%s) - hs ))
+        printf "    %-12s %-6s %-10s ${G}%-12s${N} ${D}%s${N}\n" "$n" "$MODE" "$FEC" "${age}s ago" "$(numfmt --to=iec ${tx%% *} 2>/dev/null||echo "$tx")"
+      else
+        printf "    %-12s %-6s %-10s ${R}%-12s${N}\n" "$n" "$MODE" "$FEC" "never"
+      fi
+    else
+      printf "    %-12s %-6s %-10s ${R}%-12s${N}\n" "$n" "$MODE" "$FEC" "no interface"
+    fi
+  done
+  [[ $any == 0 ]] && echo -e "    ${D}none${N}"
+  echo
+  echo -e "  ${W}Recent events${N}"
+  tail -n 6 "$LOG" 2>/dev/null | sed 's/^/    /' || echo -e "    ${D}none${N}"
+  pause
+}
+
+heal_menu() {
+  while :; do
+    clear; banner; echo; hr
+    echo -e "  ${W}${BLD}Self-healing${N}   ${D}for links that drop every few hours${N}"; hr; echo
+    local tstate gstate nextrun
+    tstate="$(systemctl is-enabled hydra-heal.timer 2>/dev/null)"
+    gstate="$(systemctl is-active hydra-guard 2>/dev/null)"
+    nextrun="$(systemctl list-timers hydra-heal.timer --no-pager 2>/dev/null | awk 'NR==2{print $1, $2, $3}')"
+
+    echo -e "  Scheduled reset      $([[ "$tstate" == enabled ]] && echo "${G}on${N}, every ${RESET_HOURS:-$RESET_HOURS_DEFAULT}h" || echo "${D}off${N}")"
+    [[ "$tstate" == enabled && -n "$nextrun" ]] && echo -e "    ${D}next: $nextrun${N}"
+    echo -e "  Handshake watchdog   $([[ "$gstate" == active ]] && echo "${G}on${N}" || echo "${D}off${N}")"
+    echo
+    echo -e "  ${D}The scheduled reset restarts every tunnel on a timer - blunt, but it${N}"
+    echo -e "  ${D}clears stale sessions and a hub address that has changed.${N}"
+    echo -e "  ${D}The watchdog is targeted: it restarts only a link whose handshake has${N}"
+    echo -e "  ${D}gone quiet for more than four minutes.${N}"
+    echo
+    hr
+    echo -e "   ${G}1${N}) Turn the scheduled reset $([[ "$tstate" == enabled ]] && echo off || echo on)"
+    echo -e "   ${G}2${N}) Change the reset interval   ${D}current: ${RESET_HOURS:-$RESET_HOURS_DEFAULT}h${N}"
+    echo -e "   ${G}3${N}) Turn the watchdog $([[ "$gstate" == active ]] && echo off || echo on)"
+    echo -e "   ${G}4${N}) Reset every tunnel now"
+    echo -e "   ${G}5${N}) Show recent heal events"
+    echo -e "   ${G}0${N}) Back"; echo
+    case "$(ask "Choice")" in
+      1) heal_install
+         if [[ "$tstate" == enabled ]]; then
+           systemctl disable --now hydra-heal.timer >/dev/null 2>&1; ok "Scheduled reset off."
+         else
+           systemctl enable --now hydra-heal.timer >/dev/null 2>&1; ok "Scheduled reset on."
+         fi; pause ;;
+      2) local h; h="$(ask "Interval in hours" "${RESET_HOURS:-$RESET_HOURS_DEFAULT}")"
+         if [[ "$h" =~ ^[0-9]+$ ]] && (( h >= 1 && h <= 168 )); then
+           RESET_HOURS="$h"; save_conf; heal_install
+           systemctl is-enabled hydra-heal.timer >/dev/null 2>&1 && systemctl restart hydra-heal.timer
+           ok "Interval set to ${h}h."
+         else err "Enter 1-168."; fi; pause ;;
+      3) heal_install
+         if [[ "$gstate" == active ]]; then
+           systemctl disable --now hydra-guard >/dev/null 2>&1; ok "Watchdog off."
+         else
+           systemctl enable --now hydra-guard >/dev/null 2>&1; ok "Watchdog on."
+         fi; pause ;;
+      4) msg "Restarting every tunnel…"; hydra_self_heal_now; ok "Done."; pause ;;
+      5) clear; echo -e "${W}Recent heal events${N}"; hr
+         grep -E 'guard:|scheduled reset' "$LOG" 2>/dev/null | tail -25 || echo -e "  ${D}none yet${N}"
+         pause ;;
+      0|"") return ;;
+    esac
+  done
+}
+
+hydra_self_heal_now() {
+  local f n
+  for f in "$EXITS"/*.conf; do [[ -f "$f" ]] && { n="$(basename "$f" .conf)"; systemctl restart "hydra-link@$n" 2>/dev/null; sleep 2; }; done
+  for f in "$LINKS"/*.conf; do [[ -f "$f" ]] && { n="$(basename "$f" .conf)"; systemctl restart "hydra-exit-link@$n" 2>/dev/null; sleep 2; }; done
+  logit "manual reset of all links"
+  return 0
+}
+
 link_tuning_menu() {
   while :; do
     clear; banner; echo; hr; echo -e "  ${W}${BLD}Link tuning${N}  ${D}for lossy or unstable routes${N}"; hr; echo
@@ -1434,6 +1745,43 @@ spd_push() {   # push current tunables into every tunnel conf and restart FEC
   for f in "$EXITS"/*.conf; do [[ -f "$f" ]] && systemctl restart "hydra-spd@$(basename "$f" .conf)" 2>/dev/null; done
   for f in "$LINKS"/*.conf; do [[ -f "$f" ]] && systemctl restart "hydra-exit-spd@$(basename "$f" .conf)" 2>/dev/null; done
   return 0
+}
+
+# Azumi's projects all warn: always uninstall before reconfiguring. That advice
+# exists because half-removed state causes exactly the symptoms we hit. So make
+# it a single action instead of a manual ritual.
+rebuild_tunnel() {
+  clear; banner; echo; hr
+  echo -e "  ${W}${BLD}Rebuild a tunnel from scratch${N}"; hr; echo
+  echo -e "  ${D}Tears everything down - services, orphaned processes, interfaces,${N}"
+  echo -e "  ${D}iptables rules, keys - then creates a fresh tunnel with the same${N}"
+  echo -e "  ${D}settings. Use this when a tunnel is stuck and you have stopped${N}"
+  echo -e "  ${D}trusting its current state.${N}"
+  echo
+  local n; n="$(ask "Tunnel name")"
+  [[ -f "$EXITS/$n.conf" ]] || { err "Not found."; pause; return; }
+  local MODE EXIT_IP; . "$EXITS/$n.conf"
+  echo
+  echo -e "  ${Y}The exit side must be cleaned too.${N}"
+  echo -e "  ${D}On $EXIT_IP run:  ${W}hydra${D}  ->  Remove a link  ->  $n${N}"
+  echo
+  askyn "Have you removed it on the exit?" n || { msg "Do that first."; pause; return; }
+
+  msg "Tearing down…"
+  systemctl disable --now "hydra-link@$n" "hydra-raw@$n" "hydra-spd@$n" >/dev/null 2>&1
+  pkill -f "udp2raw.*:$(sed -n 's/^RAW_PORT=//p' "$EXITS/$n.conf")" 2>/dev/null
+  pkill -f "speederv2.*:$(sed -n 's/^SPD_LOCAL=//p' "$EXITS/$n.conf")" 2>/dev/null
+  wg-quick down "wg-$n" 2>/dev/null
+  ip link delete "wg-$n" 2>/dev/null
+  systemctl reset-failed "hydra-link@$n" "hydra-raw@$n" "hydra-spd@$n" >/dev/null 2>&1
+  tok_wipe "$DIR/token-$n.txt"
+  rm -f "$EXITS/$n.conf" "/etc/wireguard/wg-$n.conf"
+  pf_apply_all >/dev/null 2>&1
+  ok "Torn down."
+  echo
+  echo -e "  ${D}Now create it again: menu -> Create new tunnel${N}"
+  echo -e "  ${D}Suggested: name ${W}$n${D}, IP ${W}$EXIT_IP${D}, mode ${W}$MODE${N}"
+  pause
 }
 
 reissue_invite() {
@@ -2003,7 +2351,7 @@ uninstall_all() {
   local f
   for f in "$EXITS"/*.conf; do [[ -f "$f" ]] && systemctl disable --now "hydra-link@$(basename "$f" .conf)" >/dev/null 2>&1; done
   for f in "$LINKS"/*.conf; do [[ -f "$f" ]] && systemctl disable --now "hydra-exit-link@$(basename "$f" .conf)" >/dev/null 2>&1; done
-  systemctl disable --now hydra-watch hydra-rule hydra-ports wg-quick@wg0 >/dev/null 2>&1
+  systemctl disable --now hydra-watch hydra-rule hydra-ports hydra-guard hydra-heal.timer wg-quick@wg0 >/dev/null 2>&1
   iptables -t nat -D PREROUTING  -j HYDRA_PRE  2>/dev/null
   iptables -t nat -D POSTROUTING -j HYDRA_POST 2>/dev/null
   iptables        -D FORWARD     -j HYDRA_FWD  2>/dev/null
@@ -2012,7 +2360,7 @@ uninstall_all() {
   iptables -F HYDRA_FWD 2>/dev/null; iptables -X HYDRA_FWD 2>/dev/null
   iptables -D INPUT -j HYDRA_IN 2>/dev/null
   iptables -F HYDRA_IN 2>/dev/null; iptables -X HYDRA_IN 2>/dev/null
-  rm -f /etc/systemd/system/hydra-*.service
+  rm -f /etc/systemd/system/hydra-*.service /etc/systemd/system/hydra-*.timer
   rm -f /etc/wireguard/wg-*.conf /etc/wireguard/wg0.conf
   rm -f /etc/sysctl.d/99-hydra.conf /etc/modules-load.d/hydra-bbr.conf
   rm -rf "$DIR" "$STATE"
@@ -2042,7 +2390,8 @@ menu_hub() {
     case "$(ask "Choice")" in
       1) create_tunnel ;; 2) tunnel_menu ;; 3) client_menu ;; 4) link_tuning_menu ;;
       5) port_menu ;; 6) security_menu ;; 7) apply_tune; pause ;;
-      8) logs_menu ;; 9) diagnose_menu ;; 10) game_menu ;; 11) uninstall_all ;;
+      8) logs_menu ;; 9) diagnose_menu ;; 10) game_menu ;;
+      11) heal_menu ;; 12) overview ;; 13) uninstall_all ;;
       0|q|"") clear; exit 0 ;;
     esac
   done
@@ -2061,7 +2410,9 @@ menu_exit() {
     echo -e "   ${G}6${N}) Re-apply BBR and tuning"
     echo -e "   ${G}7${N}) Events and logs"
     echo -e "   ${G}8${N}) Diagnose a tunnel       ${D}find which layer is broken${N}"
-    echo -e "   ${G}9${N}) ${R}Uninstall${N}"
+    echo -e "   ${G}9${N}) Self-healing            ${D}auto-reset for links that drop${N}"
+    echo -e "  ${G}10${N}) Overview                ${D}everything on one screen${N}"
+    echo -e "  ${G}11${N}) ${R}Uninstall${N}"
     echo -e "   ${G}0${N}) Quit"; echo
     case "$(ask "Choice")" in
       1) connect_hub ;;
@@ -2073,7 +2424,8 @@ menu_exit() {
       3) local f; for f in "$LINKS"/*.conf; do [[ -f "$f" ]] && systemctl restart "hydra-exit-link@$(basename "$f" .conf)"; done
          ok "Restarted."; pause ;;
       4) link_tuning_menu ;; 5) security_menu ;; 6) apply_tune; pause ;;
-      7) logs_menu ;; 8) diagnose_menu ;; 9) uninstall_all ;;
+      7) logs_menu ;; 8) diagnose_menu ;; 9) heal_menu ;;
+      10) overview ;; 11) uninstall_all ;;
       0|q|"") clear; exit 0 ;;
     esac
   done
@@ -2103,6 +2455,8 @@ case "${1:-}" in
   _elink-down) _elink_down "$2" ;;
   _watch)      _watch ;;
   _ports-apply) pf_apply_all >/dev/null; exit 0 ;;
+  _heal)       _heal ;;
+  _guard)      _guard ;;
   apply)       shift; apply_token "$1"; exit $? ;;
   status)      [[ "$(role)" == hub ]] && show_status_hub || show_status_exit; exit 0 ;;
   "")
