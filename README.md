@@ -426,6 +426,29 @@ verified yourself. The estimates are only as good as the endpoints behind them.
 
 ---
 
+## Reverse tunnels — when the hub's address keeps changing
+
+By default the hub dials out to each exit. That requires the exit to be reachable, which it
+normally is, but it also means the exit's ingress filter has to know the hub's address —
+and on many Iranian links that address is not stable.
+
+Menu → **Connection direction** → reverse flips who initiates. The exit dials in, the hub
+listens. The tunnel payload is identical; only the direction changes.
+
+|  | Direct | Reverse |
+|---|---|---|
+| Who connects | hub → exit | exit → hub |
+| Needs a stable address on | the exit | the hub |
+| Port must be open on | the exit | the hub |
+| Survives a changing hub IP | no | **yes** |
+
+Use direct if the hub is behind carrier NAT with no way to forward a port. Otherwise, if
+the hub's public address moves around, reverse removes an entire class of failure.
+
+Existing tunnels keep whatever direction they were built with — rebuild them to switch.
+
+---
+
 ## When the link drops every few hours
 
 Some routes will not stay up regardless of configuration. The hub's public address

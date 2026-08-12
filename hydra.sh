@@ -9,7 +9,7 @@
 set -uo pipefail
 umask 077                      # every file this script creates is owner-only
 
-VERSION="3.6.0"
+VERSION="3.7.0"
 DIR="/etc/hydra"
 EXITS="$DIR/exits.d"          # hub:  one file per foreign server
 LINKS="$DIR/links.d"          # exit: one file per hub
@@ -68,7 +68,8 @@ CLIENT_WG_PORT="51820"; LINK_PREFIX="10.66"
 RAW_PORT_BASE="39000"; SPD_LOCAL_BASE="44000"; RAW_LOCAL_BASE="33000"
 FEC="10:5"; SWITCH_MARGIN="15"; CHECK_INTERVAL="5"; HYSTERESIS="3"; PUBLIC_IF=""
 CLIENT_ISOLATION="1"; TOKEN_TTL="1800"
-SPD_MODE="0"; SPD_TIMEOUT="0"; SPD_QUEUE="200"; RESET_HOURS="6"
+SPD_MODE="0"; SPD_TIMEOUT="0"; SPD_QUEUE="200"; RESET_HOURS="6"; TUNNEL_DIR="direct"
+WG_KEEPALIVE="15"; SOCK_BUF="1024"; RAW_RETRY="2"
 HUB_PUBLIC_IP=""; INGRESS_LOCK="1"
 [[ -f "$CONF" ]] && . "$CONF"
 
@@ -96,6 +97,10 @@ SPD_MODE=$SPD_MODE
 SPD_TIMEOUT=$SPD_TIMEOUT
 SPD_QUEUE=$SPD_QUEUE
 RESET_HOURS=$RESET_HOURS
+TUNNEL_DIR=$TUNNEL_DIR
+WG_KEEPALIVE=$WG_KEEPALIVE
+SOCK_BUF=$SOCK_BUF
+RAW_RETRY=$RAW_RETRY
 EOF
   chmod 600 "$CONF"
 }
@@ -290,6 +295,34 @@ After=network-online.target
 [Service]
 EnvironmentFile=/etc/hydra/exits.d/%i.conf
 ExecStart=/usr/local/bin/speederv2 -c -l 127.0.0.1:${SPD_LOCAL} -r ${SPD_REMOTE} -f ${FEC} --mode ${SPD_MODE} --timeout ${SPD_TIMEOUT} --mtu ${SPD_MTU} --queue-len ${SPD_QUEUE} -k ${SPD_PASS}
+Restart=always
+RestartSec=2
+Nice=-10
+LimitNOFILE=65535
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat >/etc/systemd/system/hydra-raw-rev@.service <<'EOF'
+[Unit]
+Description=hydra udp2raw listener, reverse mode (%i)
+After=network-online.target
+[Service]
+EnvironmentFile=/etc/hydra/exits.d/%i.conf
+ExecStart=/usr/local/bin/udp2raw -s -l 0.0.0.0:${RAW_PORT} -r 127.0.0.1:${SPD_LOCAL} -k ${RAW_PASS} --raw-mode faketcp --cipher-mode aes128cbc --auth-mode hmac_sha1 -a --fix-gro
+Restart=always
+RestartSec=2
+Nice=-10
+LimitNOFILE=65535
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat >/etc/systemd/system/hydra-exit-raw-rev@.service <<'EOF'
+[Unit]
+Description=hydra udp2raw dialler, reverse mode (%i)
+After=network-online.target
+[Service]
+EnvironmentFile=/etc/hydra/links.d/%i.conf
+ExecStart=/usr/local/bin/udp2raw -c -l 127.0.0.1:${RAW_LOCAL} -r ${HUB_IP}:${RAW_PORT} -k ${RAW_PASS} --raw-mode faketcp --cipher-mode aes128cbc --auth-mode hmac_sha1 -a --fix-gro
 Restart=always
 RestartSec=2
 Nice=-10
@@ -574,7 +607,12 @@ create_tunnel() {
   local hub_in="$LINK_PREFIX.$idx.1" exit_in="$LINK_PREFIX.$idx.2"
   local wg_mtu spd_mtu spd_remote wg_endpoint
   case "$mode" in
-    full)  wg_mtu=1240; spd_mtu=1150; spd_remote="127.0.0.1:$raw_local"; wg_endpoint="127.0.0.1:$spd_local" ;;
+    full)  wg_mtu=1240; spd_mtu=1150
+           if [[ "${TUNNEL_DIR:-direct}" == reverse ]]; then
+             spd_remote="127.0.0.1:$spd_local"; wg_endpoint="127.0.0.1:$spd_local"
+           else
+             spd_remote="127.0.0.1:$raw_local"; wg_endpoint="127.0.0.1:$spd_local"
+           fi ;;
     fec)   wg_mtu=1300; spd_mtu=1220; spd_remote="$eip:$raw_port";       wg_endpoint="127.0.0.1:$spd_local" ;;
     plain) wg_mtu=1420; spd_mtu=1250; spd_remote="-";                    wg_endpoint="$eip:$wg_port" ;;
   esac
@@ -584,6 +622,7 @@ create_tunnel() {
 NAME=$name
 IDX=$idx
 MODE=$mode
+DIRECTION=${TUNNEL_DIR:-direct}
 EXIT_IP=$eip
 HUB_IN=$hub_in
 EXIT_IN=$exit_in
@@ -617,6 +656,7 @@ EOF
     "SPD_LOCAL=$spd_local" "WG_PORT=$wg_port" "WG_MTU=$wg_mtu" \
     "SPD_MTU=$spd_mtu" "FEC=$FEC" "RAW_PASS=$raw_pass" "SPD_PASS=$spd_pass" \
     "SPD_MODE_T=$SPD_MODE" "SPD_TIMEOUT_T=$SPD_TIMEOUT" "SPD_QUEUE_T=$SPD_QUEUE" \
+    "DIRECTION=${TUNNEL_DIR:-direct}" \
     "PSK=$psk" "HUB_PUB=$hub_pub" "TID=$tid" "EXP=$exp" | tok_encode)"
   ( umask 077; echo "$token" >"$DIR/token-$name.txt" )
   logit "tunnel $name created (mode=$mode, exit=$eip, tid=$tid) - awaiting pairing"
@@ -677,7 +717,7 @@ PublicKey    = $EXIT_PUB
 PresharedKey = $PSK
 Endpoint     = $wg_endpoint
 AllowedIPs   = 0.0.0.0/0
-PersistentKeepalive = 15
+PersistentKeepalive = ${WG_KEEPALIVE:-15}
 EOF
   )
   sed -i "s|^EXIT_PUB=.*|EXIT_PUB=$EXIT_PUB|; s|^PAIRED=.*|PAIRED=1|" "$EXITS/$NAME.conf"
@@ -735,7 +775,7 @@ apply_token() {
   local NAME="" IDX="" MODE="" HUB_IP="" HUB_IN="" EXIT_IN="" RAW_PORT="" \
         SPD_LOCAL="" WG_PORT="" WG_MTU="" SPD_MTU="" FEC="" RAW_PASS="" \
         SPD_PASS="" PSK="" HUB_PUB="" TID="" EXP="" \
-        SPD_MODE_T="" SPD_TIMEOUT_T="" SPD_QUEUE_T=""
+        SPD_MODE_T="" SPD_TIMEOUT_T="" SPD_QUEUE_T="" DIRECTION=""
   tok_decode "$1"; rc=$?
   (( rc == 0 )) || { err "Token $(tok_err $rc)."; return 1; }
   [[ -n "$NAME" && -n "$HUB_PUB" && -n "$PSK" ]] || { err "Token is incomplete."; return 1; }
@@ -754,17 +794,25 @@ apply_token() {
   local exit_priv exit_pub pif spd_listen
   exit_priv="$(wg genkey)"; exit_pub="$(echo "$exit_priv" | wg pubkey)"
   pif="$(detect_if)"
-  [[ "$MODE" == "full" ]] && spd_listen="127.0.0.1:$SPD_LOCAL" || spd_listen="0.0.0.0:$RAW_PORT"
+  if [[ "${DIRECTION:-direct}" == reverse ]]; then
+    spd_listen="127.0.0.1:$SPD_LOCAL"
+  elif [[ "$MODE" == "full" ]]; then
+    spd_listen="127.0.0.1:$SPD_LOCAL"
+  else
+    spd_listen="0.0.0.0:$RAW_PORT"
+  fi
 
   ( umask 077
     cat >"$LINKS/$NAME.conf" <<EOF
 NAME=$NAME
 IDX=$IDX
 MODE=$MODE
+DIRECTION=${DIRECTION:-direct}
 HUB_IP=$HUB_IP
 HUB_IN=$HUB_IN
 EXIT_IN=$EXIT_IN
 RAW_PORT=$RAW_PORT
+RAW_LOCAL=$(( 33000 + IDX ))
 SPD_LOCAL=$SPD_LOCAL
 SPD_LISTEN=$spd_listen
 WG_PORT=$WG_PORT
@@ -792,7 +840,7 @@ PostDown = iptables -t nat -D POSTROUTING -s $HUB_IN/32 -o $pif -j MASQUERADE; i
 PublicKey    = $HUB_PUB
 PresharedKey = $PSK
 AllowedIPs   = $HUB_IN/32
-PersistentKeepalive = 15
+PersistentKeepalive = ${WG_KEEPALIVE:-15}
 EOF
   )
   unset exit_priv
@@ -893,8 +941,10 @@ exit_lock_all() { local f; for f in "$LINKS"/*.conf; do [[ -f "$f" ]] && exit_lo
 # ================================================================ link ctl ==
 _link_up() {
   local n="$1" f="$EXITS/$1.conf"; [[ -f "$f" ]] || exit 1; . "$f"
+  local rawunit="hydra-raw@$n"
+  [[ "${DIRECTION:-direct}" == reverse ]] && rawunit="hydra-raw-rev@$n"
   case "$MODE" in
-    full) systemctl start "hydra-raw@$n"; sleep 1; systemctl start "hydra-spd@$n" ;;
+    full) systemctl start "$rawunit"; sleep 1; systemctl start "hydra-spd@$n" ;;
     fec)  systemctl start "hydra-spd@$n" ;;
   esac
   sleep 2
@@ -916,18 +966,28 @@ _link_up() {
   fi
   exit 0
 }
-_link_down() { wg-quick down "wg-$1" 2>/dev/null; systemctl stop "hydra-spd@$1" 2>/dev/null; systemctl stop "hydra-raw@$1" 2>/dev/null; exit 0; }
+_link_down() {
+  wg-quick down "wg-$1" 2>/dev/null
+  systemctl stop "hydra-spd@$1" "hydra-raw@$1" "hydra-raw-rev@$1" 2>/dev/null
+  exit 0
+}
 _elink_up() {
   local n="$1" f="$LINKS/$1.conf"; [[ -f "$f" ]] || exit 1; . "$f"
+  local rawunit="hydra-exit-raw@$n"
+  [[ "${DIRECTION:-direct}" == reverse ]] && rawunit="hydra-exit-raw-rev@$n"
   case "$MODE" in
-    full) systemctl start "hydra-exit-raw@$n"; sleep 1; systemctl start "hydra-exit-spd@$n" ;;
+    full) systemctl start "$rawunit"; sleep 1; systemctl start "hydra-exit-spd@$n" ;;
     fec)  systemctl start "hydra-exit-spd@$n" ;;
   esac
   sleep 1; wg-quick up "wg-$n" 2>/dev/null
   exit_lock "$n"
   exit 0
 }
-_elink_down() { wg-quick down "wg-$1" 2>/dev/null; systemctl stop "hydra-exit-spd@$1" 2>/dev/null; systemctl stop "hydra-exit-raw@$1" 2>/dev/null; exit 0; }
+_elink_down() {
+  wg-quick down "wg-$1" 2>/dev/null
+  systemctl stop "hydra-exit-spd@$1" "hydra-exit-raw@$1" "hydra-exit-raw-rev@$1" 2>/dev/null
+  exit 0
+}
 
 # ================================================================== probe ===
 probe() { # iface peer -> "avg mdev loss"
@@ -1059,7 +1119,7 @@ PublicKey    = $(cat "$DIR/wg0.pub" 2>/dev/null)
 PresharedKey = $psk
 Endpoint     = $(pub_ip):$CLIENT_WG_PORT
 AllowedIPs   = 0.0.0.0/0
-PersistentKeepalive = 15
+PersistentKeepalive = ${WG_KEEPALIVE:-15}
 EOF
   chmod 600 "$CLIENTS/$n.conf"
   clear; ok "Client '$n' created -> $CLIENT_PREFIX.$ipn"; echo
@@ -1139,7 +1199,8 @@ fec_menu() {
   echo -e "  ${D}with headroom, because loss arrives in bursts rather than evenly.${N}"
   echo
   printf "   ${G}1${N}) ${W}%-7s${N} ${D}%-18s tolerates ~%-6s overhead %s${N}\n" "20:5"  "loss under 2%"   "20%"  "25%"
-  printf "   ${G}2${N}) ${W}%-7s${N} ${D}%-18s tolerates ~%-6s overhead %s${N}\n" "10:5"  "loss 2-8%"       "33%"  "50%"
+  printf "   ${G}2${N}) ${W}%-7s${N} ${D}%-18s tolerates ~%-6s overhead %s${N}\n" "2:1"   "loss 2-8%, cheap" "33%"  "50%"
+  printf "   ${G}9${N}) ${W}%-7s${N} ${D}%-18s tolerates ~%-6s overhead %s${N}\n" "10:5"  "loss 2-8%"       "33%"  "50%"
   printf "   ${G}3${N}) ${W}%-7s${N} ${D}%-18s tolerates ~%-6s overhead %s${N}\n" "8:8"   "loss 8-20%"      "50%"  "100%"
   printf "   ${G}4${N}) ${W}%-7s${N} ${D}%-18s tolerates ~%-6s overhead %s${N}\n" "6:9"   "loss 20-30%"     "60%"  "150%"
   printf "   ${G}5${N}) ${W}%-7s${N} ${D}%-18s tolerates ~%-6s overhead %s${N}\n" "4:8"   "loss 30-40%"     "66%"  "200%"
@@ -1148,7 +1209,7 @@ fec_menu() {
   echo
   local new
   case "$(ask "Choice")" in
-    1) new="20:5" ;; 2) new="10:5" ;; 3) new="8:8" ;; 4) new="6:9" ;;
+    1) new="20:5" ;; 2) new="2:1" ;; 9) new="10:5" ;; 3) new="8:8" ;; 4) new="6:9" ;;
     5) new="4:8" ;; 6) new="2:6" ;;
     7) new="$(ask "Value (e.g. 12:6)")" ;;
     8) fec_measure; return ;;
@@ -1205,12 +1266,15 @@ fec_measure() {
   hr; echo
 
   local rec
-  rec="$(awk -v l="${loss%.*}" 'BEGIN{
+  # Prefer small FEC blocks: same protection, far less CPU per packet, which
+  # matters more than bandwidth on a single-core VPS.
+  local cores; cores="$(nproc 2>/dev/null || echo 1)"
+  rec="$(awk -v l="${loss%.*}" -v c="$cores" 'BEGIN{
     if (l<1)       print "20:5";
-    else if (l<5)  print "10:5";
-    else if (l<12) print "8:8";
-    else if (l<22) print "6:9";
-    else if (l<35) print "4:8";
+    else if (l<8)  print (c<2 ? "2:1" : "10:5");
+    else if (l<15) print (c<2 ? "2:2" : "8:8");
+    else if (l<25) print (c<2 ? "2:3" : "6:9");
+    else if (l<40) print (c<2 ? "2:4" : "4:8");
     else           print "2:6";
   }')"
 
@@ -1385,6 +1449,55 @@ mtu_probe() {
 
 # FEC encoding is CPU work. On a 1-core VPS a high parity ratio can saturate the
 # core and create the very loss it was meant to absorb.
+transport_menu() {
+  while :; do
+    clear; banner; echo; hr
+    echo -e "  ${W}${BLD}Transport tuning${N}"; hr; echo
+    echo -e "  WireGuard keepalive   ${W}${WG_KEEPALIVE:-15}s${N}   ${D}lower = faster recovery, more chatter${N}"
+    echo -e "  Socket buffer         ${W}${SOCK_BUF:-1024}${N} KB   ${D}raise on high-latency links${N}"
+    echo -e "  udp2raw retry delay   ${W}${RAW_RETRY:-2}s${N}    ${D}how fast it redials after a drop${N}"
+    echo; hr
+    echo -e "  ${D}Defaults suit a normal link. Change these only if the tunnel keeps${N}"
+    echo -e "  ${D}dropping or you are on a very high-latency path.${N}"
+    echo
+    echo -e "   ${G}1${N}) Keepalive interval"
+    echo -e "   ${G}2${N}) Socket buffer size"
+    echo -e "   ${G}3${N}) Retry delay"
+    echo -e "   ${G}4${N}) Restore defaults"
+    echo -e "   ${G}0${N}) Back"; echo
+    case "$(ask "Choice")" in
+      1) local v; v="$(ask "Keepalive seconds (5-60)" "${WG_KEEPALIVE:-15}")"
+         if [[ "$v" =~ ^[0-9]+$ ]] && (( v>=5 && v<=60 )); then
+           WG_KEEPALIVE="$v"; save_conf
+           local f n
+           for f in /etc/wireguard/wg-*.conf; do
+             [[ -f "$f" ]] && sed -i "s/^PersistentKeepalive.*/PersistentKeepalive = $v/" "$f"
+           done
+           ok "Keepalive set to ${v}s. Restart the links to apply."
+         else err "Enter 5-60."; fi; pause ;;
+      2) local v; v="$(ask "Buffer in KB (256-8192)" "${SOCK_BUF:-1024}")"
+         if [[ "$v" =~ ^[0-9]+$ ]] && (( v>=256 && v<=8192 )); then
+           SOCK_BUF="$v"; save_conf
+           local bytes=$(( v * 1024 ))
+           sysctl -w net.core.rmem_default="$bytes" >/dev/null 2>&1
+           sysctl -w net.core.wmem_default="$bytes" >/dev/null 2>&1
+           sed -i "s/^net.core.rmem_default.*/net.core.rmem_default = $bytes/; s/^net.core.wmem_default.*/net.core.wmem_default = $bytes/" /etc/sysctl.d/99-hydra.conf 2>/dev/null
+           ok "Buffer set to ${v}KB."
+         else err "Enter 256-8192."; fi; pause ;;
+      3) local v; v="$(ask "Retry delay seconds (1-30)" "${RAW_RETRY:-2}")"
+         if [[ "$v" =~ ^[0-9]+$ ]] && (( v>=1 && v<=30 )); then
+           RAW_RETRY="$v"; save_conf
+           sed -i "s/^RestartSec=.*/RestartSec=$v/" /etc/systemd/system/hydra-raw*@.service \
+                                                    /etc/systemd/system/hydra-exit-raw*@.service 2>/dev/null
+           systemctl daemon-reload
+           ok "Retry delay set to ${v}s."
+         else err "Enter 1-30."; fi; pause ;;
+      4) WG_KEEPALIVE=15; SOCK_BUF=1024; RAW_RETRY=2; save_conf; ok "Restored."; pause ;;
+      0|"") return ;;
+    esac
+  done
+}
+
 cpu_check() {
   clear; banner; echo; hr
   echo -e "  ${W}${BLD}CPU headroom${N}"; hr; echo
@@ -1563,6 +1676,53 @@ _guard() {
 
 # Azumi's scripts expose a live status/log view on every tunnel. Ours buried the
 # same information across three menus. This puts it on one screen.
+# ============================================================= reverse mode ==
+#  Normally the hub dials out to each exit. That needs the EXIT to have a stable
+#  address - fine - but the exit's ingress filter then needs the HUB's address,
+#  and the hub's address is the one that keeps changing on Iranian links.
+#
+#  In reverse mode the roles flip at the transport layer: the HUB listens and
+#  the EXIT dials in. The hub's address can change freely; only the exit needs
+#  to be reachable, and it always is.
+#
+#  The tunnel payload is identical either way - this only changes who connects.
+
+reverse_explain() {
+  echo -e "  ${W}Direct${N}   ${D}hub dials the exit${N}"
+  echo -e "    ${D}needs: exit reachable, hub address stable enough for the ingress lock${N}"
+  echo -e "    ${D}breaks when: the hub's public address changes${N}"
+  echo
+  echo -e "  ${W}Reverse${N}  ${D}exit dials the hub${N}"
+  echo -e "    ${D}needs: hub reachable on one port${N}"
+  echo -e "    ${D}breaks when: the hub is behind NAT with no port forward${N}"
+  echo
+  echo -e "  ${D}If your hub's address moves around, reverse is the answer.${N}"
+  echo -e "  ${D}If your hub is behind carrier NAT, direct is the only option.${N}"
+}
+
+reverse_menu() {
+  clear; banner; echo; hr
+  echo -e "  ${W}${BLD}Connection direction${N}"; hr; echo
+  reverse_explain
+  echo; hr
+  echo -e "  ${D}Current default for new tunnels: ${W}${TUNNEL_DIR:-direct}${N}"
+  echo
+  echo -e "   ${G}1${N}) New tunnels dial out    ${D}direct${N}"
+  echo -e "   ${G}2${N}) New tunnels are dialled ${D}reverse${N}"
+  echo -e "   ${G}0${N}) Back"; echo
+  case "$(ask "Choice")" in
+    1) TUNNEL_DIR=direct; save_conf; ok "New tunnels will be direct." ;;
+    2) TUNNEL_DIR=reverse; save_conf
+       ok "New tunnels will be reverse."
+       echo -e "  ${D}Existing tunnels keep their current direction - rebuild them to change it.${N}"
+       local p; p="$((RAW_PORT_BASE))"
+       warn "Open TCP ${p}xx on THIS server's firewall - the exits will connect in."
+       ;;
+    *) return ;;
+  esac
+  pause
+}
+
 overview() {
   clear; banner; echo; hr
   echo -e "  ${W}${BLD}Overview${N}"; hr; echo
@@ -1727,6 +1887,7 @@ link_tuning_menu() {
       7) mtu_probe ;;
       8) cpu_check ;;
       9) bandwidth_test ;;
+      10) transport_menu ;;
       0|"") return ;;
     esac
   done
@@ -2391,7 +2552,7 @@ menu_hub() {
       1) create_tunnel ;; 2) tunnel_menu ;; 3) client_menu ;; 4) link_tuning_menu ;;
       5) port_menu ;; 6) security_menu ;; 7) apply_tune; pause ;;
       8) logs_menu ;; 9) diagnose_menu ;; 10) game_menu ;;
-      11) heal_menu ;; 12) overview ;; 13) uninstall_all ;;
+      11) heal_menu ;; 12) overview ;; 13) reverse_menu ;; 14) uninstall_all ;;
       0|q|"") clear; exit 0 ;;
     esac
   done

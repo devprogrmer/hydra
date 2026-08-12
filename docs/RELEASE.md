@@ -1,4 +1,4 @@
-# hydra v3.6.0
+# hydra v3.7.0
 
 Multi-exit gaming tunnel with FEC, faketcp obfuscation and automatic latency-based
 failover. English interface, one-line curl install, no Docker.
@@ -9,6 +9,36 @@ failover. English interface, one-line curl install, no Docker.
 ---
 
 ## English
+
+### New in 3.7.0 — reverse mode and cheaper FEC
+
+**Reverse tunnels.** Normally the hub dials out to each exit. In reverse mode the exit
+dials in and the hub listens. The payload is identical; only the direction of the
+connection changes. This matters because on many Iranian links the hub's public address
+is not stable — it can differ between reboots or even between requests — which breaks the
+exit's peer entry and its ingress filter. In reverse mode the hub's address becomes
+irrelevant. Menu → **Connection direction**. Use direct only if the hub sits behind NAT
+with no forwarded port.
+
+**Small-block FEC profiles.** `2:1`, `2:2`, `2:3`, `2:4` alongside the existing large-block
+ratios. These give identical loss protection at identical bandwidth cost, but with much
+smaller blocks:
+
+| Setting | Tolerates | Bandwidth | Block size |
+|---|---|---|---|
+| `4:8` | ~67% | 3.0x | 12 packets |
+| `2:4` | ~67% | 3.0x | **6 packets** |
+
+Half the encoding work per block for the same protection. On a single-core VPS the CPU cost
+of FEC can itself create the packet loss it was installed to prevent, so the recommendation
+engine now prefers small blocks when `nproc` reports one core.
+
+**Transport tuning.** WireGuard keepalive interval, socket buffer size and udp2raw retry
+delay are now adjustable rather than hardcoded.
+
+Both the reverse-tunnel pattern and the small-ratio FEC style are taken from
+[Musixal/GamingVPN](https://github.com/Musixal/GamingVPN) and
+[Azumi67/udp_tun](https://github.com/Azumi67/udp_tun).
 
 ### New in 3.6.0 — self-healing
 
