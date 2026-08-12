@@ -378,6 +378,54 @@ exit in `plain` mode for bulk traffic and pin it.
 
 ---
 
+## Testing a customer's ping before they ever get a config
+
+Menu → **Game latency test**. No game client, no WireGuard config, nobody has to install
+anything. It pings well-known game endpoints *through* a chosen exit and reports each leg
+separately.
+
+```
+GAME                   REGION        EXIT>SRV LOSS    EST PING  RATING
+Dota 2                 Europe West   31ms     0%      94ms      playable
+CS2 / CSGO             Europe East   44ms     1.2%    107ms     playable
+Valorant               Europe        no reply -       -         filtered
+```
+
+Four modes: one game in detail, every game through one exit, the same game across every
+exit (so you know which to pin), or any custom host.
+
+### What it can and cannot tell you
+
+The full path is `player → hub → exit → game server`. This measures the last two legs —
+everything you control. **It cannot measure the player's own latency to the hub**, because
+that depends on their ISP and their distance, neither of which is visible from the server.
+
+So the detailed view prints the server-side total and then adds typical player latencies:
+
+```
+server-side total      69ms
+
+Tehran fibre           +10ms  =   79ms  good
+Tehran ADSL            +25ms  =   94ms  playable
+Mobile 4G              +45ms  =  114ms  playable
+```
+
+That is the number that makes support tractable: if a customer reports 180ms while the
+table says 94ms, the extra 86ms is on their side — their wifi, their ISP, their distance —
+not your tunnel. And if the table itself looks bad, you know before they ever complain.
+
+### Two honest caveats
+
+**Many game servers filter ICMP.** `no reply` means that endpoint does not answer ping, not
+that the route is broken. Use a region that does answer, or **Test a custom host** with an
+address you have seen your own traffic use.
+
+**The bundled endpoints are best-effort.** Publishers change IPs without notice. For numbers
+you can rely on, edit the list (menu → option 5) and replace them with addresses you have
+verified yourself. The estimates are only as good as the endpoints behind them.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Check |

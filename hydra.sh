@@ -9,7 +9,7 @@
 set -uo pipefail
 umask 077                      # every file this script creates is owner-only
 
-VERSION="3.3.0"
+VERSION="3.4.0"
 DIR="/etc/hydra"
 EXITS="$DIR/exits.d"          # hub:  one file per foreign server
 LINKS="$DIR/links.d"          # exit: one file per hub
@@ -1635,6 +1635,311 @@ security_menu() {
   done
 }
 
+# ============================================================== game testing ==
+#  Measures what a player would actually feel, WITHOUT anyone needing a config
+#  or a game client. The chain is:
+#
+#     player -> [a] -> Iran hub -> [b] -> exit -> [c] -> game server
+#
+#  [b] and [c] are measured here. [a] is the player's own ISP latency to the
+#  Iran hub and CANNOT be measured from the server - the player has to supply
+#  it, or you estimate it from their city. The tool is explicit about this
+#  rather than printing a number that pretends to be the final ping.
+
+GAMES_FILE="$DIR/games.conf"
+
+game_defaults() {
+  cat <<'EOF'
+# game|region|host|note
+Dota 2|Europe West|185.25.183.1|Valve Luxembourg
+Dota 2|Europe East|155.133.238.1|Valve Vienna
+Dota 2|Dubai|185.25.180.1|Valve Dubai
+CS2 / CSGO|Europe West|155.133.240.1|Valve Frankfurt
+CS2 / CSGO|Europe East|155.133.238.1|Valve Vienna
+CS2 / CSGO|Dubai|185.25.180.1|Valve Dubai
+Valorant|Europe|104.18.32.1|Riot EU edge
+League of Legends|Europe West|162.249.72.1|Riot EUW
+PUBG|Europe|52.58.0.1|AWS Frankfurt
+PUBG|Middle East|157.241.0.1|AWS Bahrain
+Rainbow Six Siege|Europe|185.38.0.1|Ubisoft EU
+Call of Duty|Europe|52.58.0.1|Activision EU edge
+eFootball|Europe|35.156.0.1|Konami EU
+Fortnite|Europe|18.194.0.1|Epic EU
+Apex Legends|Europe|162.254.192.1|EA EU
+Rocket League|Europe|35.156.0.1|Psyonix EU
+Minecraft (Hypixel)|Europe|172.65.230.1|Hypixel EU
+GTA Online|Europe|192.81.241.1|Rockstar EU
+EOF
+}
+
+games_load() {
+  [[ -f "$GAMES_FILE" ]] || ( umask 077; game_defaults >"$GAMES_FILE" )
+  grep -v '^#' "$GAMES_FILE" | grep -v '^[[:space:]]*$'
+}
+
+# Ping a host FROM a given exit, through the tunnel. Returns "avg loss".
+ping_via_exit() {
+  local exit_name="$1" host="$2" count="${3:-20}"
+  local out avg loss
+  # source-route through the tunnel interface so the packet really takes the path
+  out="$(ping -I "wg-$exit_name" -c "$count" -i 0.2 -W 2 -q "$host" 2>/dev/null)"
+  avg="$(sed  -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p' <<<"$out")"
+  loss="$(sed -n 's/.*, \([0-9.]*\)% packet loss.*/\1/p' <<<"$out")"
+  echo "${avg:--} ${loss:-100}"
+}
+
+# Latency of the tunnel leg itself (hub -> exit), the part you control.
+tunnel_leg() {
+  local n="$1" peer out avg
+  peer="$(sed -n 's/^EXIT_IN=//p' "$EXITS/$n.conf" 2>/dev/null)"
+  [[ -n "$peer" ]] || { echo "-"; return; }
+  out="$(ping -I "wg-$n" -c 10 -i 0.2 -W 2 -q "$peer" 2>/dev/null)"
+  avg="$(sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p' <<<"$out")"
+  echo "${avg:--}"
+}
+
+rate_ping() {   # colour + verdict for a final estimated ping
+  local ms="${1%.*}"
+  if   (( ms < 60  )); then echo "${G}excellent${N}"
+  elif (( ms < 90  )); then echo "${G}good${N}"
+  elif (( ms < 130 )); then echo "${Y}playable${N}"
+  elif (( ms < 180 )); then echo "${Y}rough${N}"
+  else                      echo "${R}bad${N}"; fi
+}
+
+game_test_one() {
+  clear; banner; echo; hr
+  echo -e "  ${W}${BLD}Test one game${N}"; hr; echo
+
+  local names; names="$(for f in "$EXITS"/*.conf; do [[ -f "$f" ]] && basename "$f" .conf; done | tr '\n' ' ')"
+  [[ -n "${names// /}" ]] || { err "No tunnels yet."; pause; return; }
+
+  # pick a game
+  local i=0 line
+  local -a G_NAME G_REG G_HOST G_NOTE
+  while IFS='|' read -r gname greg ghost gnote; do
+    [[ -z "$gname" ]] && continue
+    i=$((i+1)); G_NAME[i]="$gname"; G_REG[i]="$greg"; G_HOST[i]="$ghost"; G_NOTE[i]="$gnote"
+  done < <(games_load)
+
+  local j
+  for j in $(seq 1 $i); do
+    printf "   ${G}%2s${N}) %-22s ${D}%-14s %s${N}\n" "$j" "${G_NAME[j]}" "${G_REG[j]}" "${G_NOTE[j]}"
+  done
+  echo
+  local sel; sel="$(ask "Game number")"
+  [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= i )) || { err "Invalid selection."; pause; return; }
+
+  echo
+  echo -e "  ${D}Available exits: ${W}$names${N}"
+  local n; n="$(ask "Test through which exit?" "$(cut -d' ' -f1 <<<"$names")")"
+  [[ -f "$EXITS/$n.conf" ]] || { err "Exit not found."; pause; return; }
+  wg show "wg-$n" >/dev/null 2>&1 || { err "That tunnel is not up."; pause; return; }
+
+  clear; banner; echo; hr
+  echo -e "  ${W}${BLD}${G_NAME[$sel]}${N}  ${D}via ${G_REG[$sel]} (${G_HOST[$sel]})${N}"; hr; echo
+  echo -e "  ${D}measuring…${N}"
+
+  local leg; leg="$(tunnel_leg "$n")"
+  read -r gp gl < <(ping_via_exit "$n" "${G_HOST[$sel]}" 25)
+
+  printf "\r%*s\r" 60 ""
+  if [[ "$gp" == "-" ]]; then
+    echo -e "  ${Y}No ICMP reply from the game endpoint.${N}"
+    echo -e "  ${D}Most game servers filter ping. This does NOT mean the route is broken -${N}"
+    echo -e "  ${D}it means this particular endpoint will not answer. Try another region,${N}"
+    echo -e "  ${D}or use 'Test a custom host' with an address you know replies.${N}"
+    echo
+    echo -e "  Tunnel leg (hub to exit): ${W}${leg}ms${N}   ${D}this part is measurable and healthy${N}"
+    pause; return
+  fi
+
+  echo -e "  ${W}Measured${N}"
+  echo -e "    hub -> exit            ${W}${leg}ms${N}"
+  echo -e "    exit -> game server    ${W}${gp}ms${N}   ${D}loss ${gl}%${N}"
+  echo
+  local server_side
+  server_side="$(awk -v a="$leg" -v b="$gp" 'BEGIN{printf "%.0f", a+b}')"
+  echo -e "    server-side total      ${W}${server_side}ms${N}   ${D}everything you control${N}"
+  echo
+  hr
+  echo -e "  ${W}What the player will see${N}"
+  echo -e "  ${D}Add the player's own latency to the Iran hub. Typical values:${N}"
+  echo
+  local city rtt est
+  for city in "Tehran fibre:10" "Tehran ADSL:25" "Mashhad/Isfahan:30" "Mobile 4G:45" "Remote province:60"; do
+    rtt="${city##*:}"
+    est="$(awk -v s="$server_side" -v r="$rtt" 'BEGIN{printf "%.0f", s+r}')"
+    printf "    %-22s +%-5s = ${W}%4sms${N}  %b\n" "${city%%:*}" "${rtt}ms" "$est" "$(rate_ping "$est")"
+  done
+  echo
+  hr
+  if [[ "${gl%.*}" -gt 2 ]]; then
+    echo -e "  ${Y}${gl}% loss on the exit-to-game leg.${N}"
+    echo -e "  ${D}That is beyond your tunnel - it is the exit datacentre's route to the${N}"
+    echo -e "  ${D}game server. FEC does not cover this leg. Another exit region may be better.${N}"
+  fi
+  echo -e "  ${D}If a customer reports worse than the estimate above, the extra latency is${N}"
+  echo -e "  ${D}on their side: their ISP, their wifi, or their distance to the hub.${N}"
+  pause
+}
+
+game_test_all() {
+  clear; banner; echo; hr
+  echo -e "  ${W}${BLD}Test every game through one exit${N}"; hr; echo
+  local names; names="$(for f in "$EXITS"/*.conf; do [[ -f "$f" ]] && basename "$f" .conf; done | tr '\n' ' ')"
+  [[ -n "${names// /}" ]] || { err "No tunnels yet."; pause; return; }
+  echo -e "  ${D}Available exits: ${W}$names${N}"; echo
+  local n; n="$(ask "Exit" "$(cut -d' ' -f1 <<<"$names")")"
+  [[ -f "$EXITS/$n.conf" ]] || { err "Not found."; pause; return; }
+  wg show "wg-$n" >/dev/null 2>&1 || { err "That tunnel is not up."; pause; return; }
+
+  local leg; leg="$(tunnel_leg "$n")"
+  clear; banner; echo; hr
+  echo -e "  ${W}${BLD}All games via exit '$n'${N}   ${D}tunnel leg ${leg}ms${N}"; hr; echo
+  echo -e "  ${D}Estimates assume a player 25ms from the hub. Adjust for your customer.${N}"
+  echo
+  printf "  ${W}%-22s %-13s %-8s %-7s %-9s %s${N}\n" "GAME" "REGION" "EXIT>SRV" "LOSS" "EST PING" "RATING"
+  hr
+
+  local gname greg ghost gnote gp gl total
+  while IFS='|' read -r gname greg ghost gnote; do
+    [[ -z "$gname" ]] && continue
+    read -r gp gl < <(ping_via_exit "$n" "$ghost" 8)
+    if [[ "$gp" == "-" ]]; then
+      printf "  %-22s %-13s ${D}%-8s %-7s %-9s %s${N}\n" "$gname" "$greg" "no reply" "-" "-" "filtered"
+    else
+      total="$(awk -v a="$leg" -v b="$gp" 'BEGIN{printf "%.0f", a+b+25}')"
+      printf "  %-22s %-13s %-8s %-7s %-9s %b\n" \
+        "$gname" "$greg" "${gp}ms" "${gl}%" "${total}ms" "$(rate_ping "$total")"
+    fi
+  done < <(games_load)
+
+  echo; hr
+  echo -e "  ${D}'filtered' means the endpoint blocks ICMP, not that the route is bad.${N}"
+  echo -e "  ${D}EST PING = tunnel leg + exit-to-server + 25ms assumed player latency.${N}"
+  pause
+}
+
+game_compare_exits() {
+  clear; banner; echo; hr
+  echo -e "  ${W}${BLD}Which exit is best for one game?${N}"; hr; echo
+
+  local i=0
+  local -a G_NAME G_REG G_HOST
+  while IFS='|' read -r gname greg ghost gnote; do
+    [[ -z "$gname" ]] && continue
+    i=$((i+1)); G_NAME[i]="$gname"; G_REG[i]="$greg"; G_HOST[i]="$ghost"
+  done < <(games_load)
+  local j
+  for j in $(seq 1 $i); do
+    printf "   ${G}%2s${N}) %-22s ${D}%s${N}\n" "$j" "${G_NAME[j]}" "${G_REG[j]}"
+  done
+  echo
+  local sel; sel="$(ask "Game number")"
+  [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= i )) || { err "Invalid."; pause; return; }
+
+  clear; banner; echo; hr
+  echo -e "  ${W}${BLD}${G_NAME[$sel]}${N}  ${D}${G_REG[$sel]}${N}"; hr; echo
+  printf "  ${W}%-12s %-10s %-10s %-9s %s${N}\n" "EXIT" "TUNNEL" "EXIT>SRV" "TOTAL" "RATING"
+  hr
+  local f n leg gp gl total best="" bestv=99999
+  for f in "$EXITS"/*.conf; do
+    [[ -f "$f" ]] || continue
+    n="$(basename "$f" .conf)"
+    wg show "wg-$n" >/dev/null 2>&1 || { printf "  %-12s ${R}%s${N}\n" "$n" "tunnel down"; continue; }
+    leg="$(tunnel_leg "$n")"
+    read -r gp gl < <(ping_via_exit "$n" "${G_HOST[$sel]}" 12)
+    if [[ "$gp" == "-" ]]; then
+      printf "  %-12s %-10s ${D}%-10s %-9s %s${N}\n" "$n" "${leg}ms" "no reply" "-" "filtered"
+      continue
+    fi
+    total="$(awk -v a="$leg" -v b="$gp" 'BEGIN{printf "%.0f", a+b}')"
+    printf "  %-12s %-10s %-10s %-9s %b\n" "$n" "${leg}ms" "${gp}ms" "${total}ms" "$(rate_ping "$((total+25))")"
+    (( ${total%.*} < bestv )) && { bestv="${total%.*}"; best="$n"; }
+  done
+  echo; hr
+  [[ -n "$best" ]] && echo -e "  Best exit for this game: ${G}$best${N} ${D}(${bestv}ms server-side)${N}"
+  echo -e "  ${D}Pin it with: Manage tunnels -> Pin to an exit${N}"
+  pause
+}
+
+game_custom() {
+  clear; banner; echo; hr
+  echo -e "  ${W}${BLD}Test a custom host${N}"; hr; echo
+  echo -e "  ${D}Use this for a game server you know the address of, or any host that${N}"
+  echo -e "  ${D}answers ping. Address or hostname both work.${N}"; echo
+  local h; h="$(ask "Host or IP")"
+  [[ -n "$h" ]] || return
+  local names; names="$(for f in "$EXITS"/*.conf; do [[ -f "$f" ]] && basename "$f" .conf; done | tr '\n' ' ')"
+  local n; n="$(ask "Through which exit?" "$(cut -d' ' -f1 <<<"$names")")"
+  [[ -f "$EXITS/$n.conf" ]] || { err "Not found."; pause; return; }
+  wg show "wg-$n" >/dev/null 2>&1 || { err "That tunnel is not up."; pause; return; }
+
+  echo
+  echo -e "  ${D}measuring…${N}"
+  local leg; leg="$(tunnel_leg "$n")"
+  read -r gp gl < <(ping_via_exit "$n" "$h" 25)
+  printf "\r%*s\r" 40 ""
+  if [[ "$gp" == "-" ]]; then
+    err "No reply from $h (it may filter ICMP)."
+    pause; return
+  fi
+  local server_side; server_side="$(awk -v a="$leg" -v b="$gp" 'BEGIN{printf "%.0f", a+b}')"
+  echo -e "  hub -> exit           ${W}${leg}ms${N}"
+  echo -e "  exit -> $h  ${W}${gp}ms${N}  ${D}loss ${gl}%${N}"
+  echo -e "  server-side total     ${W}${server_side}ms${N}"
+  echo
+  echo -e "  ${D}Player's final ping = this + their own latency to the hub.${N}"
+  pause
+}
+
+game_edit_list() {
+  clear; banner; echo; hr
+  echo -e "  ${W}${BLD}Game server list${N}"; hr; echo
+  echo -e "  ${D}Stored in $GAMES_FILE${N}"
+  echo -e "  ${D}Format: name|region|host|note - one per line.${N}"
+  echo
+  echo -e "  ${Y}These are best-effort endpoints for the regions Iranian players usually${N}"
+  echo -e "  ${Y}connect to. Publishers change IPs without notice, and many filter ICMP.${N}"
+  echo -e "  ${D}For numbers you can rely on, replace them with addresses you have seen${N}"
+  echo -e "  ${D}your own traffic actually use.${N}"
+  echo
+  echo -e "   ${G}1${N}) Edit the list      ${G}2${N}) Restore defaults      ${G}0${N}) Back"
+  echo
+  case "$(ask "Choice")" in
+    1) games_load >/dev/null
+       ${EDITOR:-nano} "$GAMES_FILE" ;;
+    2) if askyn "Overwrite with defaults?" n; then ( umask 077; game_defaults >"$GAMES_FILE" ); ok "Restored."; fi; pause ;;
+    *) return ;;
+  esac
+}
+
+game_menu() {
+  while :; do
+    clear; banner; echo; hr
+    echo -e "  ${W}${BLD}Game latency test${N}   ${D}no game client or config needed${N}"
+    hr; echo
+    echo -e "  ${D}Measures the part of the path you control: hub -> exit -> game server.${N}"
+    echo -e "  ${D}The player's own latency to the hub is added as an estimate.${N}"
+    echo; hr
+    echo -e "   ${G}1${N}) Test one game            ${D}detailed, with player estimates${N}"
+    echo -e "   ${G}2${N}) Test all games           ${D}one exit, full table${N}"
+    echo -e "   ${G}3${N}) Compare exits for a game ${D}which server to pin${N}"
+    echo -e "   ${G}4${N}) Test a custom host"
+    echo -e "   ${G}5${N}) Edit the game server list"
+    echo -e "   ${G}0${N}) Back"; echo
+    case "$(ask "Choice")" in
+      1) game_test_one ;;
+      2) game_test_all ;;
+      3) game_compare_exits ;;
+      4) game_custom ;;
+      5) game_edit_list ;;
+      0|"") return ;;
+    esac
+  done
+}
+
 diagnose_menu() {
   clear; banner; echo; hr; echo -e "  ${W}${BLD}Diagnose a tunnel${N}"; hr; echo
   local n; n="$(ask "Tunnel name")"
@@ -1731,12 +2036,13 @@ menu_hub() {
     echo -e "   ${G}7${N}) Re-apply BBR and tuning"
     echo -e "   ${G}8${N}) Events and logs"
     echo -e "   ${G}9${N}) Diagnose a tunnel       ${D}find which layer is broken${N}"
-    echo -e "   ${G}10${N}) ${R}Uninstall${N}"
+    echo -e "  ${G}10${N}) ${W}Game latency test${N}       ${D}what will the player's ping be${N}"
+    echo -e "  ${G}11${N}) ${R}Uninstall${N}"
     echo -e "   ${G}0${N}) Quit"; echo
     case "$(ask "Choice")" in
       1) create_tunnel ;; 2) tunnel_menu ;; 3) client_menu ;; 4) link_tuning_menu ;;
       5) port_menu ;; 6) security_menu ;; 7) apply_tune; pause ;;
-      8) logs_menu ;; 9) diagnose_menu ;; 10) uninstall_all ;;
+      8) logs_menu ;; 9) diagnose_menu ;; 10) game_menu ;; 11) uninstall_all ;;
       0|q|"") clear; exit 0 ;;
     esac
   done

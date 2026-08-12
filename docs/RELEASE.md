@@ -1,4 +1,4 @@
-# hydra v3.3.0
+# hydra v3.4.0
 
 Multi-exit gaming tunnel with FEC, faketcp obfuscation and automatic latency-based
 failover. English interface, one-line curl install, no Docker.
@@ -9,6 +9,26 @@ failover. English interface, one-line curl install, no Docker.
 ---
 
 ## English
+
+### New in 3.4.0 — game latency testing
+
+Test what a customer's ping will be before handing them a config, without anyone installing
+a game or a VPN client. Pings known game endpoints through a chosen exit and reports each
+leg of the path separately: hub to exit, exit to game server.
+
+- **Test one game** — detailed breakdown plus estimated final ping for typical Iranian
+  connection types (Tehran fibre, ADSL, mobile, remote province).
+- **Test all games** — full table through one exit.
+- **Compare exits for a game** — which exit to pin for a given title.
+- **Test a custom host** — for endpoints you have verified yourself.
+- **Editable endpoint list** at `/etc/hydra/games.conf`.
+
+The player's own latency to the hub cannot be measured from the server, so it is added as
+a labelled estimate rather than folded silently into the total. That distinction is the
+point: when a customer reports a worse ping than the table predicts, the difference is on
+their side.
+
+Endpoints that filter ICMP are reported as `filtered`, not as failures.
 
 ### New in 3.3.0 — diagnosing loss instead of guessing at it
 
