@@ -1,4 +1,4 @@
-# hydra v3.7.0
+# hydra v3.7.1
 
 Multi-exit gaming tunnel with FEC, faketcp obfuscation and automatic latency-based
 failover. English interface, one-line curl install, no Docker.
@@ -9,6 +9,14 @@ failover. English interface, one-line curl install, no Docker.
 ---
 
 ## English
+
+### Fixed in 3.7.1
+
+The port-forwarding functions were lost during an earlier edit, leaving `port_menu`
+calling helpers that no longer existed. Every action in that menu failed with
+`pf_apply_all: command not found`, and "Add ports" silently returned to the menu without
+saving anything. All of them are restored and now defined near the top of the file, before
+any caller. Anyone on 3.7.0 who uses port forwarding should update.
 
 ### New in 3.7.0 — reverse mode and cheaper FEC
 

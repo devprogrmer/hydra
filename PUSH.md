@@ -23,14 +23,14 @@ Never paste a token into a script, a commit, or a chat again.
 
     cd hydra
     git add .
-    git commit -m "hydra v3.7.0 - high-loss FEC profiles, link tuning, diagnostics"
+    git commit -m "hydra v3.7.1 - high-loss FEC profiles, link tuning, diagnostics"
     git push origin main
 
 First time:
 
     git init -b main
     git add .
-    git commit -m "hydra v3.7.0"
+    git commit -m "hydra v3.7.1"
     git remote add origin https://github.com/devprogrmer/hydra.git
     git push -u origin main
 
@@ -43,15 +43,15 @@ Both must be HTTP 200. Raw URLs cache for a few minutes after a push.
 
 ## Tag and release
 
-    git tag -a v3.7.0 -m "hydra v3.7.0"
-    git push origin v3.7.0
+    git tag -a v3.7.1 -m "hydra v3.7.1"
+    git push origin v3.7.1
 
 .github/workflows/release.yml then builds the tarball, generates SHA256SUMS and
 publishes the release using docs/RELEASE.md as the body.
 
 Manual alternative:
 
-    gh release create v3.7.0 --title "hydra v3.7.0" --notes-file docs/RELEASE.md
+    gh release create v3.7.1 --title "hydra v3.7.1" --notes-file docs/RELEASE.md
 
 ## Repo metadata
 

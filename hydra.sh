@@ -9,7 +9,7 @@
 set -uo pipefail
 umask 077                      # every file this script creates is owner-only
 
-VERSION="3.7.0"
+VERSION="3.7.1"
 DIR="/etc/hydra"
 EXITS="$DIR/exits.d"          # hub:  one file per foreign server
 LINKS="$DIR/links.d"          # exit: one file per hub
@@ -118,6 +118,201 @@ detect_pub_ip() {         # what the outside world sees, which is NOT always the
   echo "${a:-$b}"
 }
 role() { cat "$ROLE_FILE" 2>/dev/null || echo ""; }
+
+# =========================================================== port forwards ==
+#  Stored in $EXITS/<name>.ports  - one line per entry:  <proto> <port list>
+#  Applied in dedicated chains, so they can always be flushed and rebuilt cleanly.
+#  Defined here, near the top, because several callers run before the menus.
+
+PF_CHUNK=15          # iptables multiport limit
+
+pf_norm() {          # "80, 443, 7777-7784" -> "80,443,7777:7784"  (or fail)
+  local raw="${1// /}" out="" t a b
+  [[ -n "$raw" ]] || return 1
+  for t in ${raw//,/ }; do
+    if [[ "$t" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
+      a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"
+      (( a>=1 && a<=65535 && b>=1 && b<=65535 && a<=b )) || return 1
+      out+="$a:$b,"
+    elif [[ "$t" =~ ^[0-9]{1,5}$ ]]; then
+      (( t>=1 && t<=65535 )) || return 1
+      out+="$t,"
+    else return 1; fi
+  done
+  echo "${out%,}"
+}
+
+pf_count() {         # number of entries (a range counts as 2)
+  local t n=0
+  for t in ${1//,/ }; do [[ "$t" == *:* ]] && n=$((n+2)) || n=$((n+1)); done
+  echo "$n"
+}
+
+pf_chunks() {        # split a long list into legal multiport chunks
+  local t c cost=0 cur=""
+  for t in ${1//,/ }; do
+    [[ "$t" == *:* ]] && c=2 || c=1
+    if (( cost + c > PF_CHUNK )); then echo "${cur%,}"; cur=""; cost=0; fi
+    cur+="$t,"; cost=$((cost+c))
+  done
+  [[ -n "$cur" ]] && echo "${cur%,}"
+}
+
+pf_reserved() {      # ports that must not be forwarded or the server goes dark
+  local f sshp
+  sshp="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)"
+  echo -n "${sshp:-22} ${CLIENT_WG_PORT:-51820}"
+  for f in "$EXITS"/*.conf; do
+    [[ -f "$f" ]] && echo -n " $(sed -n 's/^RAW_PORT=//p' "$f")"
+  done
+  echo
+}
+
+pf_conflicts() {     # which requested ports collide with critical ones
+  local list="$1" t p a b conf=""
+  local res; res="$(pf_reserved)"
+  for t in ${list//,/ }; do
+    if [[ "$t" == *:* ]]; then
+      a="${t%%:*}"; b="${t##*:}"
+      for p in $res; do [[ -n "$p" ]] && (( p>=a && p<=b )) && conf+="$p "; done
+    else
+      for p in $res; do [[ "$t" == "$p" ]] && conf+="$p "; done
+    fi
+  done
+  echo "$conf"
+}
+
+pf_chains_init() {
+  iptables -t nat -N HYDRA_PRE  2>/dev/null
+  iptables -t nat -N HYDRA_POST 2>/dev/null
+  iptables        -N HYDRA_FWD  2>/dev/null
+  iptables -t nat -C PREROUTING  -j HYDRA_PRE  2>/dev/null || iptables -t nat -I PREROUTING  1 -j HYDRA_PRE
+  iptables -t nat -C POSTROUTING -j HYDRA_POST 2>/dev/null || iptables -t nat -I POSTROUTING 1 -j HYDRA_POST
+  iptables        -C FORWARD     -j HYDRA_FWD  2>/dev/null || iptables        -I FORWARD     1 -j HYDRA_FWD
+}
+
+pf_apply_all() {     # rebuild everything from the files (idempotent)
+  pf_chains_init
+  iptables -t nat -F HYDRA_PRE  2>/dev/null
+  iptables -t nat -F HYDRA_POST 2>/dev/null
+  iptables        -F HYDRA_FWD  2>/dev/null
+  iptables -A HYDRA_FWD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+  if [[ "${CLIENT_ISOLATION:-1}" == 1 ]]; then
+    iptables -A HYDRA_FWD -i wg0 -o wg0 -j DROP 2>/dev/null
+    local net
+    for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 127.0.0.0/8 100.64.0.0/10; do
+      iptables -A HYDRA_FWD -i wg0 -d "$net" -j DROP 2>/dev/null
+    done
+  fi
+
+  local f name proto list pr chunk rules=0
+  for f in "$EXITS"/*.ports; do
+    [[ -f "$f" ]] || continue
+    name="$(basename "$f" .ports)"
+    [[ -f "$EXITS/$name.conf" ]] || continue
+    local EXIT_IN; EXIT_IN="$(sed -n 's/^EXIT_IN=//p' "$EXITS/$name.conf")"
+    [[ -n "$EXIT_IN" ]] || continue
+    iptables -t nat -A HYDRA_POST -o "wg-$name" -j MASQUERADE 2>/dev/null
+    while read -r proto list; do
+      [[ -z "${proto:-}" || -z "${list:-}" ]] && continue
+      for pr in $( [[ "$proto" == both ]] && echo "tcp udp" || echo "$proto" ); do
+        while read -r chunk; do
+          [[ -z "$chunk" ]] && continue
+          iptables -t nat -A HYDRA_PRE -i "$PUBLIC_IF" -p "$pr" -m multiport --dports "$chunk" \
+                   -j DNAT --to-destination "$EXIT_IN" 2>/dev/null && rules=$((rules+1))
+          iptables -A HYDRA_FWD -d "$EXIT_IN" -p "$pr" -m multiport --dports "$chunk" -j ACCEPT 2>/dev/null
+        done < <(pf_chunks "$list")
+      done
+    done <"$f"
+  done
+  echo "$rules"
+}
+
+pf_table() {         # table of current forwards
+  printf "  ${W}%-4s %-10s %-6s %s${N}\n" "#" "EXIT" "PROTO" "PORTS"
+  hr
+  local f name proto list i=0
+  for f in "$EXITS"/*.ports; do
+    [[ -f "$f" ]] || continue
+    name="$(basename "$f" .ports)"
+    while read -r proto list; do
+      [[ -z "${proto:-}" ]] && continue
+      i=$((i+1))
+      printf "  %-4s %-10s %-6s %s\n" "$i" "$name" "$proto" "${list//:/-}"
+    done <"$f"
+  done
+  [[ $i == 0 ]] && echo -e "  ${D}No ports forwarded.${N}"
+  return 0
+}
+
+pf_nth() {           # return row n as "name<TAB>proto list"
+  local want="$1" f name proto list i=0
+  for f in "$EXITS"/*.ports; do
+    [[ -f "$f" ]] || continue
+    name="$(basename "$f" .ports)"
+    while read -r proto list; do
+      [[ -z "${proto:-}" ]] && continue
+      i=$((i+1))
+      [[ "$i" == "$want" ]] && { printf '%s\t%s %s\n' "$name" "$proto" "$list"; return 0; }
+    done <"$f"
+  done
+  return 1
+}
+
+pf_add() {
+  clear; banner; echo; hr; echo -e "  ${W}${BLD}Add a port forward${N}"; hr; echo
+  local names n; names="$(for f in "$EXITS"/*.conf; do [[ -f "$f" ]] && basename "$f" .conf; done | tr '\n' ' ')"
+  [[ -n "${names// /}" ]] || { err "Create a tunnel first."; pause; return; }
+  echo -e "  ${D}Available exits: ${W}$names${N}"; echo
+  n="$(ask "Forward to which exit?")"
+  [[ -f "$EXITS/$n.conf" ]] || { err "Exit '$n' not found."; pause; return; }
+
+  echo
+  echo -e "  ${D}Separate ports with commas, ranges with a hyphen:${N}"
+  echo -e "  ${D}e.g. ${W}50820,2097,2096,443,80${N}   ${D}or${N}  ${W}27015,7777-7784${N}"
+  echo
+  local raw list; raw="$(ask "Ports")"
+  list="$(pf_norm "$raw")" || { err "Invalid list. Only numbers 1-65535, commas and hyphens."; pause; return; }
+
+  local conf; conf="$(pf_conflicts "$list")"
+  if [[ -n "${conf// /}" ]]; then
+    echo
+    warn "These ports are in use by this server: ${W}${conf}${N}"
+    echo -e "  ${D}Forwarding them takes down SSH, WireGuard or the tunnel itself.${N}"
+    echo -e "  ${D}If you are connected remotely, this may cut you off right now.${N}"; echo
+    askyn "Continue anyway?" n || { msg "Cancelled."; pause; return; }
+  fi
+
+  echo
+  echo -e "   ${G}1${N}) Both (TCP + UDP)   ${G}2${N}) TCP only   ${G}3${N}) UDP only"; echo
+  local proto
+  case "$(ask "Protocol" "1")" in 2) proto=tcp ;; 3) proto=udp ;; *) proto=both ;; esac
+
+  echo "$proto $list" >>"$EXITS/$n.ports"
+  local applied; applied="$(pf_apply_all)"
+  logit "port-forward add $n [$proto] $list"
+  echo
+  ok "$(pf_count "$list") port(s) forwarded to '$n' ($proto)."
+  echo -e "  ${D}Collapsed into $applied multiport rule(s), not one rule per port.${N}"
+  pause
+}
+
+pf_del() {
+  clear; banner; echo; hr; echo -e "  ${W}${BLD}Remove a port forward${N}"; hr; echo
+  pf_table; echo; hr
+  local sel row name rest
+  sel="$(ask "Row number to remove (blank to cancel)")"
+  [[ -n "$sel" ]] || return
+  row="$(pf_nth "$sel")" || { err "Invalid row number."; pause; return; }
+  name="${row%%$'\t'*}"; rest="${row#*$'\t'}"
+  grep -vxF "$rest" "$EXITS/$name.ports" >"$EXITS/$name.ports.tmp" 2>/dev/null
+  mv -f "$EXITS/$name.ports.tmp" "$EXITS/$name.ports"
+  [[ -s "$EXITS/$name.ports" ]] || rm -f "$EXITS/$name.ports"
+  pf_apply_all >/dev/null
+  logit "port-forward del $name [$rest]"
+  ok "Removed."; pause
+}
+
 
 
 # ================================================================== tokens ==
