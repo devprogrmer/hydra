@@ -9,7 +9,7 @@
 set -uo pipefail
 umask 077                      # every file this script creates is owner-only
 
-VERSION="3.7.1"
+VERSION="3.8.0"
 DIR="/etc/hydra"
 EXITS="$DIR/exits.d"          # hub:  one file per foreign server
 LINKS="$DIR/links.d"          # exit: one file per hub
@@ -314,6 +314,153 @@ pf_del() {
 }
 
 
+
+# ================================================================= firewall ==
+#  Opening the tunnel port by hand was the single most common setup failure.
+#  We can do it automatically for the local firewall. What we CANNOT touch is a
+#  provider firewall (Hetzner Cloud Firewall, OVH, AWS security groups) - those
+#  live outside the machine, so we detect the situation and say so plainly.
+
+fw_detect() {        # -> ufw | firewalld | iptables | none
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    echo ufw
+  elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+    echo firewalld
+  elif command -v iptables >/dev/null; then
+    echo iptables
+  else
+    echo none
+  fi
+}
+
+fw_open() {          # fw_open <proto> <port> [label]
+  local proto="$1" port="$2" label="${3:-hydra}" fw
+  fw="$(fw_detect)"
+  case "$fw" in
+    ufw)
+      ufw allow "$port/$proto" comment "$label" >/dev/null 2>&1 \
+        && { logit "firewall: opened $proto/$port via ufw"; echo ufw; return 0; }
+      ;;
+    firewalld)
+      firewall-cmd --permanent --add-port="$port/$proto" >/dev/null 2>&1 \
+        && firewall-cmd --reload >/dev/null 2>&1 \
+        && { logit "firewall: opened $proto/$port via firewalld"; echo firewalld; return 0; }
+      ;;
+    iptables)
+      iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null \
+        || iptables -I INPUT 1 -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null
+      command -v netfilter-persistent >/dev/null && netfilter-persistent save >/dev/null 2>&1
+      logit "firewall: opened $proto/$port via iptables"
+      echo iptables; return 0
+      ;;
+  esac
+  echo none; return 1
+}
+
+fw_close() {         # remove a rule we added
+  local proto="$1" port="$2"
+  case "$(fw_detect)" in
+    ufw)       ufw delete allow "$port/$proto" >/dev/null 2>&1 ;;
+    firewalld) firewall-cmd --permanent --remove-port="$port/$proto" >/dev/null 2>&1
+               firewall-cmd --reload >/dev/null 2>&1 ;;
+    iptables)  while iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do :; done ;;
+  esac
+  return 0
+}
+
+# Is the port actually reachable from outside? The local firewall being open
+# does not prove a provider firewall is.
+fw_port_open_locally() {
+  local proto="$1" port="$2"
+  case "$(fw_detect)" in
+    ufw)       ufw status 2>/dev/null | grep -qE "^${port}/${proto}\s+ALLOW" ;;
+    firewalld) firewall-cmd --list-ports 2>/dev/null | grep -q "${port}/${proto}" ;;
+    iptables)  iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null ;;
+    *)         return 0 ;;   # no firewall running = nothing blocking
+  esac
+}
+
+# Ports a given tunnel needs, given its mode and direction.
+fw_ports_for() {     # fw_ports_for <conf-file> <side>  -> "proto port"
+  local f="$1" side="$2"
+  local MODE DIRECTION RAW_PORT WG_PORT
+  MODE="$(sed -n 's/^MODE=//p' "$f")"
+  DIRECTION="$(sed -n 's/^DIRECTION=//p' "$f")"; DIRECTION="${DIRECTION:-direct}"
+  RAW_PORT="$(sed -n 's/^RAW_PORT=//p' "$f")"
+  WG_PORT="$(sed -n 's/^WG_PORT=//p' "$f")"
+
+  # whoever LISTENS needs the port open
+  local listens=0
+  if [[ "$DIRECTION" == reverse ]]; then
+    [[ "$side" == hub ]] && listens=1
+  else
+    [[ "$side" == exit ]] && listens=1
+  fi
+  (( listens )) || return 1
+
+  case "$MODE" in
+    full)  echo "tcp $RAW_PORT" ;;
+    fec)   echo "udp $RAW_PORT" ;;
+    plain) echo "udp $WG_PORT" ;;
+    *) return 1 ;;
+  esac
+}
+
+fw_menu() {
+  while :; do
+    clear; banner; echo; hr
+    echo -e "  ${W}${BLD}Firewall${N}"; hr; echo
+    local fw; fw="$(fw_detect)"
+    echo -e "  Detected            ${W}$fw${N}"
+    [[ "$fw" == none ]] && echo -e "  ${D}No active firewall found - nothing local is blocking.${N}"
+    echo
+    echo -e "  ${W}Ports this server needs${N}"
+    local side dir f any=0 proto port
+    side=hub; [[ "$(role)" != hub ]] && side=exit
+    dir="$EXITS"; [[ "$side" == exit ]] && dir="$LINKS"
+    for f in "$dir"/*.conf; do
+      [[ -f "$f" ]] || continue
+      if read -r proto port < <(fw_ports_for "$f" "$side"); then
+        any=1
+        if fw_port_open_locally "$proto" "$port"; then
+          printf "    %-10s %-6s %-8s %b\n" "$(basename "$f" .conf)" "$proto" "$port" "${G}open${N}"
+        else
+          printf "    %-10s %-6s %-8s %b\n" "$(basename "$f" .conf)" "$proto" "$port" "${R}closed${N}"
+        fi
+      else
+        printf "    %-10s ${D}%s${N}\n" "$(basename "$f" .conf)" "dials out - no inbound port needed"
+      fi
+    done
+    [[ $any == 0 ]] && echo -e "    ${D}none needed${N}"
+    echo
+    echo -e "  ${Y}A provider firewall is separate.${N}"
+    echo -e "  ${D}Hetzner Cloud Firewall, OVH, AWS security groups and similar sit outside${N}"
+    echo -e "  ${D}this machine. Nothing here can change them - open the port in that panel too.${N}"
+    echo; hr
+    echo -e "   ${G}1${N}) Open every port this server needs"
+    echo -e "   ${G}2${N}) Open a specific port"
+    echo -e "   ${G}0${N}) Back"; echo
+    case "$(ask "Choice")" in
+      1) local opened=0
+         for f in "$dir"/*.conf; do
+           [[ -f "$f" ]] || continue
+           if read -r proto port < <(fw_ports_for "$f" "$side"); then
+             fw_open "$proto" "$port" "hydra-$(basename "$f" .conf)" >/dev/null && opened=$((opened+1))
+           fi
+         done
+         ok "$opened port(s) opened."
+         [[ "$fw" == none ]] && warn "No firewall was running, so nothing needed opening locally."
+         pause ;;
+      2) local pr pt
+         pr="$(ask "Protocol (tcp/udp)" "tcp")"
+         pt="$(ask "Port")"
+         if [[ "$pr" =~ ^(tcp|udp)$ ]] && [[ "$pt" =~ ^[0-9]+$ ]] && (( pt>=1 && pt<=65535 )); then
+           fw_open "$pr" "$pt" hydra-manual >/dev/null && ok "Opened $pr/$pt." || warn "Nothing to do."
+         else err "Invalid input."; fi; pause ;;
+      0|"") return ;;
+    esac
+  done
+}
 
 # ================================================================== tokens ==
 #  Tokens carry NO private keys. The exit generates its own WireGuard private
@@ -844,6 +991,14 @@ ENABLED=1
 EOF
   )
 
+  # If this hub will be listening (reverse mode), open its port now.
+  if [[ "${TUNNEL_DIR:-direct}" == reverse ]]; then
+    local fwp fwproto
+    case "$mode" in full) fwproto=tcp; fwp=$raw_port ;; fec) fwproto=udp; fwp=$raw_port ;; *) fwproto=udp; fwp=$wg_port ;; esac
+    local res; res="$(fw_open "$fwproto" "$fwp" "hydra-$name")"
+    [[ "$res" != none ]] && ok "Opened $fwproto/$fwp in the local $res firewall."
+  fi
+
   local token
   token="$(printf '%s\n' \
     "NAME=$name" "IDX=$idx" "MODE=$mode" "HUB_IP=$(pub_ip)" \
@@ -891,13 +1046,24 @@ finish_pairing() {
   local want_tid; want_tid="$(sed -n 's/^TID=//p' "$EXITS/$NAME.conf")"
   [[ "$TID" == "$want_tid" ]] || { err "This reply does not match the pending invite for '$NAME'."; pause; return; }
 
+  # Keep the decoded key safe: sourcing the conf below re-imports an EMPTY
+  # EXIT_PUB= line and would silently overwrite it, producing a config with a
+  # blank PublicKey that WireGuard refuses to parse.
+  local decoded_pub="$EXIT_PUB"
   local HUB_PRIV HUB_IN WG_MTU EXIT_IP MODE WG_PORT SPD_LOCAL PSK
   . "$EXITS/$NAME.conf"
+  EXIT_PUB="$decoded_pub"
   local wg_endpoint
   case "$MODE" in
     plain) wg_endpoint="$EXIT_IP:$WG_PORT" ;;
     *)     wg_endpoint="127.0.0.1:$SPD_LOCAL" ;;
   esac
+
+  if [[ -z "$EXIT_PUB" || -z "$HUB_PRIV" ]]; then
+    err "Internal error: the peer key is empty - refusing to write a broken config."
+    echo -e "  ${D}Re-issue the invite and pair again.${N}"
+    pause; return
+  fi
 
   ( umask 077
     cat >"/etc/wireguard/wg-$NAME.conf" <<EOF
@@ -915,6 +1081,10 @@ AllowedIPs   = 0.0.0.0/0
 PersistentKeepalive = ${WG_KEEPALIVE:-15}
 EOF
   )
+  if ! grep -qE '^PublicKey *= *[A-Za-z0-9+/]{42,44}=' "/etc/wireguard/wg-$NAME.conf"; then
+    err "The written config has no valid PublicKey. Aborting."
+    pause; return
+  fi
   sed -i "s|^EXIT_PUB=.*|EXIT_PUB=$EXIT_PUB|; s|^PAIRED=.*|PAIRED=1|" "$EXITS/$NAME.conf"
   tok_wipe "$DIR/token-$NAME.txt"          # invite is single use - destroy it
 
@@ -1040,6 +1210,18 @@ EOF
   )
   unset exit_priv
 
+  # The exit listens in direct mode - open its port without being asked.
+  if [[ "${DIRECTION:-direct}" != reverse ]]; then
+    local fwproto fwp
+    case "$MODE" in full) fwproto=tcp; fwp=$RAW_PORT ;; fec) fwproto=udp; fwp=$RAW_PORT ;; *) fwproto=udp; fwp=$WG_PORT ;; esac
+    local res; res="$(fw_open "$fwproto" "$fwp" "hydra-$NAME")"
+    if [[ "$res" != none ]]; then
+      ok "Opened $fwproto/$fwp in the local $res firewall."
+    else
+      msg "No local firewall detected - nothing to open here."
+    fi
+  fi
+
   exit_lock "$NAME"
   systemctl enable --now "hydra-exit-link@$NAME" >/dev/null 2>&1
   logit "link $NAME configured from hub $HUB_IP"
@@ -1050,10 +1232,13 @@ EOF
   echo
   ok "Link '$NAME' configured (mode $MODE)."
   case "$MODE" in
-    full)  echo -e "  ${Y}TCP port $RAW_PORT${N} must be open in this server's firewall." ;;
-    fec)   echo -e "  ${Y}UDP port $RAW_PORT${N} must be open in this server's firewall." ;;
-    plain) echo -e "  ${Y}UDP port $WG_PORT${N} must be open in this server's firewall." ;;
+    full)  echo -e "  ${D}Local firewall: TCP $RAW_PORT handled above.${N}" ;;
+    fec)   echo -e "  ${D}Local firewall: UDP $RAW_PORT handled above.${N}" ;;
+    plain) echo -e "  ${D}Local firewall: UDP $WG_PORT handled above.${N}" ;;
   esac
+  echo -e "  ${Y}If your provider has its own firewall (Hetzner Cloud Firewall, OVH,${N}"
+  echo -e "  ${Y}AWS security groups), open the same port there too - this script${N}"
+  echo -e "  ${Y}cannot reach it.${N}"
   echo
   hr
   echo -e "  ${W}${BLD}Take this reply token back to the hub${N}"
@@ -2747,7 +2932,8 @@ menu_hub() {
       1) create_tunnel ;; 2) tunnel_menu ;; 3) client_menu ;; 4) link_tuning_menu ;;
       5) port_menu ;; 6) security_menu ;; 7) apply_tune; pause ;;
       8) logs_menu ;; 9) diagnose_menu ;; 10) game_menu ;;
-      11) heal_menu ;; 12) overview ;; 13) reverse_menu ;; 14) uninstall_all ;;
+      11) heal_menu ;; 12) overview ;; 13) reverse_menu ;;
+      14) fw_menu ;; 15) uninstall_all ;;
       0|q|"") clear; exit 0 ;;
     esac
   done
@@ -2768,7 +2954,8 @@ menu_exit() {
     echo -e "   ${G}8${N}) Diagnose a tunnel       ${D}find which layer is broken${N}"
     echo -e "   ${G}9${N}) Self-healing            ${D}auto-reset for links that drop${N}"
     echo -e "  ${G}10${N}) Overview                ${D}everything on one screen${N}"
-    echo -e "  ${G}11${N}) ${R}Uninstall${N}"
+    echo -e "  ${G}11${N}) Firewall                ${D}check and open the ports needed${N}"
+    echo -e "  ${G}12${N}) ${R}Uninstall${N}"
     echo -e "   ${G}0${N}) Quit"; echo
     case "$(ask "Choice")" in
       1) connect_hub ;;
@@ -2781,7 +2968,7 @@ menu_exit() {
          ok "Restarted."; pause ;;
       4) link_tuning_menu ;; 5) security_menu ;; 6) apply_tune; pause ;;
       7) logs_menu ;; 8) diagnose_menu ;; 9) heal_menu ;;
-      10) overview ;; 11) uninstall_all ;;
+      10) overview ;; 11) fw_menu ;; 12) uninstall_all ;;
       0|q|"") clear; exit 0 ;;
     esac
   done

@@ -1,4 +1,4 @@
-# hydra v3.7.1
+# hydra v3.8.0
 
 Multi-exit gaming tunnel with FEC, faketcp obfuscation and automatic latency-based
 failover. English interface, one-line curl install, no Docker.
@@ -9,6 +9,32 @@ failover. English interface, one-line curl install, no Docker.
 ---
 
 ## English
+
+### Fixed in 3.8.0 — the empty public key bug
+
+**This was the cause of every "you have to paste the exit's public key manually" report.**
+`finish_pairing` decoded the exit's public key from the reply token, then sourced the
+tunnel's config file — which contains an empty `EXIT_PUB=` line. Sourcing overwrote the
+decoded key with nothing, and the WireGuard config was written with a blank `PublicKey`,
+which WireGuard refuses to parse. Pairing appeared to succeed and the tunnel never came up.
+
+The decoded key is now preserved across the source, and the written config is verified to
+contain a valid key before pairing is marked complete. No more manual key pasting.
+
+### Added in 3.8.0 — automatic firewall
+
+Opening the tunnel port by hand was the most common setup failure. hydra now detects ufw,
+firewalld or raw iptables and opens the required port automatically when a tunnel is
+created or a token applied. A new **Firewall** menu shows which ports each side needs and
+whether they are open.
+
+It is explicit about what it cannot do: provider firewalls (Hetzner Cloud Firewall, OVH,
+AWS security groups) live outside the machine and must still be opened in that panel.
+
+### Added — step-by-step setup guides
+
+`docs/SETUP.md` and `docs/SETUP.fa.md`: nine numbered steps from install to first client,
+with a troubleshooting table and an honest section on what a tunnel can and cannot do.
 
 ### Fixed in 3.7.1
 

@@ -6,7 +6,7 @@
 
 تونل گیمینگ چند-خروجی، با FEC و تیونینگ BBR.
 
-[English](README.md) · [یادداشت انتشار](docs/RELEASE.md)
+[English](README.md) · [راهنمای قدم‌به‌قدم](docs/SETUP.fa.md) · [Step-by-step](docs/SETUP.md) · [یادداشت انتشار](docs/RELEASE.md)
 
 </div>
 

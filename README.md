@@ -6,7 +6,7 @@
 
 A multi-exit, FEC-protected, BBR-tuned gaming tunnel.
 
-[فارسی](README.fa.md) · [Release notes](docs/RELEASE.md)
+[فارسی](README.fa.md) · [Step-by-step setup](docs/SETUP.md) · [راهنمای قدم‌به‌قدم](docs/SETUP.fa.md) · [Release notes](docs/RELEASE.md)
 
 </div>
 
